@@ -1893,6 +1893,7 @@ def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
     opt_graph = top_level_function_source(opt_source, "_run_opt_3stage_graph")
     k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
     k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
+    k1_asm = K1_INT8_ASM_PATH.read_text(encoding="utf-8")
     k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
     k3_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
     k2_py = (K2_FUSED_DIR / "k2_fused.py").read_text(encoding="utf-8")
@@ -1910,6 +1911,13 @@ def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
     assert "k1_init_compact_rows_kernel<<<row_init_blocks, row_init_threads" in k1_ext
     assert "__shfl_up(inclusive_tiles, offset, 64)" in k1_ext
     assert "min(inclusive_tiles, capacity_tiles)" in k1_ext
+    assert "int32_t* active_tiles;" in k1_ext
+    assert "offsetof(GpuProb, active_tiles) == 0xf8" in k1_ext
+    assert "prob.active_tiles = use_compact_prebuild" in k1_ext
+    assert ".L_k1_active_tile_gate_done" in k1_asm
+    assert "s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xf8" in k1_asm
+    assert "s_lshr_b32 s89, s[sgprWorkGroup0], 4" in k1_asm
+    assert "label_SymmRoutePrebuiltActiveTile" not in k1_asm
     assert "std::min<int64_t>(" in k1_ext
     assert "capacity_rows + kK1RowPointerPadding" in k1_ext
     assert "return_active_tiles_host_hint=int8_compute" in opt_3stage

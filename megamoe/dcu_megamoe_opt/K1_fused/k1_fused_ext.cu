@@ -295,6 +295,7 @@ struct __attribute__((packed)) GpuProb {
     int64_t* row_combine_ptrs;
     int32_t* meta_flags;
     int32_t* local_expert_stats;
+    int32_t* active_tiles;
 };
 
 static_assert(offsetof(GpuProb, staged_x) == 0x80,
@@ -321,6 +322,8 @@ static_assert(offsetof(GpuProb, meta_flags) == 0xe8,
               "fused L1 asm expects meta_flags at GpuProb+0xe8");
 static_assert(offsetof(GpuProb, local_expert_stats) == 0xf0,
               "fused L1 asm expects local_expert_stats at GpuProb+0xf0");
+static_assert(offsetof(GpuProb, active_tiles) == 0xf8,
+              "fused L1 asm expects active_tiles at GpuProb+0xf8");
 static_assert(sizeof(GpuProb) <= 256,
               "K1 GpuProb must fit in the 256-byte argument slot");
 
@@ -1040,6 +1043,10 @@ int64_t launch_l1_deepgemm_fused_asm(
     prob.local_expert_stats = local_expert_stats == nullptr
         ? nullptr
         : local_expert_stats->data_ptr<int32_t>();
+    prob.active_tiles = use_compact_prebuild
+        ? reinterpret_cast<int32_t*>(route_scratch.data_ptr()) +
+              compact_active_tiles_offset
+        : nullptr;
 
     const int64_t prob_offset =
         deep_gemm::mega::align_i64(meta_flags_offset + meta_flags_bytes, 16);

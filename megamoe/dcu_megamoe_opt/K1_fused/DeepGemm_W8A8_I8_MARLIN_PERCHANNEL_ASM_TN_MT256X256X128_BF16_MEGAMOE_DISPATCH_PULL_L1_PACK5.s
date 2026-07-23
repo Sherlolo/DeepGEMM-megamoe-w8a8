@@ -1370,6 +1370,24 @@ s_waitcnt lgkmcnt(0)
 s_mov_b32 m0, 0x10000                              // LDS clamp at 65536 bytes
 v_mov_b32 v[vgprSerial], v0                        // thread serial id
 
+/* YGZP INT8 K1 has 4096 output features, hence 16 N workgroups per
+ * compact row tile. Gate the flat launch before grouped-GEMM argument
+ * parsing and workgroup remapping so inactive capacity tiles do not consume
+ * the generic prologue. */
+s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+s_cbranch_scc1 .L_k1_active_tile_gate_done
+s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xf8
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u64 s[90:91], 0
+s_cbranch_scc1 .L_k1_active_tile_gate_done
+s_load_dword s88, s[90:91], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshr_b32 s89, s[sgprWorkGroup0], 4
+s_cmp_ge_u32 s89, s88
+s_cbranch_scc0 .L_k1_active_tile_gate_done
+s_endpgm
+.L_k1_active_tile_gate_done:
+
 /* Check if custom structure pointer is null */
 s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0 // s[ExternalArgAddress] == 0 ?
 s_cbranch_scc0 label_IsExternalValid               // branch if s[ExternalArgAddress] != 0
@@ -2232,17 +2250,6 @@ s_mov_b32 s54, BufferLimit
 s_mov_b32 s55, Srd127_96
 s_load_dword s61, s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc4 // packed compact metadata
 s_waitcnt lgkmcnt(0)
-s_and_b32 s62, s61, 0xffff                         // route_scratch active_tiles i32 offset
-v_mov_b32 v253, s62
-v_lshlrev_b32 v253, 2, v253
-buffer_load_dword v252, v253, s[52:55], 0, offen, offset:0
-s_waitcnt vmcnt(0)
-v_readfirstlane_b32 s60, v252
-s_cmp_ge_u32 s[sgprWorkGroup1], s60
-s_cbranch_scc0 label_SymmRoutePrebuiltActiveTile
-s_endpgm
-
-label_SymmRoutePrebuiltActiveTile:
 	s_and_b32 s62, s61, 0xffff                         // active_tiles offset
 	s_add_u32 s62, s62, 1                              // tile_experts offset
 	s_add_u32 s62, s62, s[sgprWorkGroup1]

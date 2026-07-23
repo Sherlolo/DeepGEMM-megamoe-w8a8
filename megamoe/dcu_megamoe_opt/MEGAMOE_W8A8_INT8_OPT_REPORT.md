@@ -5,15 +5,19 @@
 在 `e08r3n03` 的 `sglang_glm_0721` 容器、8 张 `gfx936` DCU 上，EP8
 `288 experts / topk=8 / H=4096 / I=2048 / 512 tokens per rank` 的
 `megamoe_w8a8_int8` 端到端均值从 **2.054666 ms** 降到
-**1.947806 ms**，提升 **5.2008%**。最终三轮极差/均值为 **0.0719%**，
-小于增益；相对现有 DeepEP + DeepGEMM INT8 reference 的均值
-2.931572 ms，最终路径约 **1.505x**。
+**1.938959 ms**，提升 **5.6314%**。本轮继续优化相对已接受版本的
+同环境父版本 1.945146 ms 再降 **0.3181%**；最终三轮极差/均值为
+**0.2837%**，小于增益。相对现有 DeepEP + DeepGEMM INT8 reference
+的可靠均值 2.931572 ms，最终路径约 **1.512x**。
 
 精度保持不变：随机路由 3/3 次均为
 `max_abs=0.00048828125`、`mean_abs=1.02747695e-05`、
-`stats_exact=true`。单本地 rank 极端偏斜路由 3/3 为零误差；
-`capacity=1024, tokens=512` 邻近容量场景 3/3 通过。源码契约测试
-33/33 通过。
+`stats_exact=true`。首次优化完成时，单本地 rank 极端偏斜路由 3/3
+为零误差，`capacity=1024, tokens=512` 邻近容量场景 3/3 通过；本轮
+源码契约测试 33/33 通过。本轮收尾时节点上另有一个 8 卡 SGLang
+服务占用约 56–57 GiB/卡，容量与偏斜复跑均在 reference 输出张量
+分配阶段 OOM、尚未进入候选结果比较，因此不把这两次环境失败计为
+新的精度结论。
 
 ## 仓库与编译流程
 
@@ -66,6 +70,19 @@ exclusive base、tile-to-expert 映射和 active-tile 总数。prefix 从
 曾尝试自写带分支的 `ds_bpermute` helper，但严格精度出现
 `max_abs=0.097900390625`，在性能测试前即淘汰并记录。
 
+### 4. K1 无效 capacity workgroup 在汇编入口退出
+
+K1 原先虽然由 device `active_tiles` 截断，但判断位置在 grouped-GEMM
+参数解析、workgroup remap 和较大汇编序言之后。最终版本把
+`active_tiles` device pointer 通过 `GpuProb` ABI 传给 K1；由于当前
+INT8 K1 固定输出宽度 4096、每个 compact row tile 对应 16 个 N 方向
+workgroup，入口直接用 flat workgroup id 计算 row tile，并在无效时
+立即结束。
+
+该修改没有重新引入 D2H 或 stream synchronize，也没有改变 K1/K3
+公共 Python API。K1 的 workgroup、LDS、VGPR、SGPR 和 scratch 资源
+保持不变。
+
 ## 稳定性能
 
 | 版本 | 三轮 fused median（ms） | 均值（ms） | 相对原始 |
@@ -74,6 +91,7 @@ exclusive base、tile-to-expert 映射和 active-tile 总数。prefix 从
 | v001 无 D2H | 1.975239 / 1.982239 / 1.977439 | 1.978305 | -3.7165% |
 | v002 多 CU init | 1.957179 / 1.961319 / 1.959659 | 1.959386 | -4.6373% |
 | v003b wave prefix | 1.948299 / 1.948219 / 1.946899 | 1.947806 | **-5.2008%** |
+| v008 K1 入口 gate | 1.942199 / 1.937979 / 1.936699 | 1.938959 | **-5.6314%** |
 
 所有稳定测量均使用相同 seed/shape、10 次 warmup、100 次 repeat，并
 在每轮前记录设备状态。
@@ -100,16 +118,31 @@ exclusive base、tile-to-expert 映射和 active-tile 总数。prefix 从
 等待最慢 rank，而非有效计算，因此不把其绝对值用于 kernel
 吞吐比较。
 
+本轮 K1 定向 PMC 相对继续优化前父版本：
+
+| K1 指标 | 变化 |
+|---|---:|
+| active VALU instructions | -6.1984% |
+| VALU instructions | -9.2649% |
+| VMEM reads | -2.2107% |
+| LDS wait instructions | -9.3294% |
+| VMEM stores / LDS bank conflict | 不变 |
+
+最终 K1 code object 仍为 768 threads/workgroup、64 KiB LDS、256 VGPR、
+112 SGPR、0 scratch。最终 full trace 未出现 MegaMoE 热路径 D2H。
+当前 hipprof 的 SQTT 路径不可用，standalone code-object analyzer 也
+拒绝 raw `.co`，因此本轮以 PMC 与汇编 metadata 作为指令和资源证据。
+
 ## 融合可行性
 
 - `count -> prefix/build -> init -> emit` 存在全 grid 数据依赖。普通
   multi-block HIP kernel 没有隐式 grid barrier，直接合并会产生竞态。
 - pre-dispatch 与 K1 之间的 rank barrier 负责让 symmetric-buffer
   写入对 peer 可见，不能跨通信边界直接融合。
-- `k1_init_compact_routes_kernel` 可以合法并入已有 start
-  `rank_barrier_kernel`：barrier 在同一 stream 上先于 count 完成。
-  这是当前唯一明确的后续编辑，可减少约 5 us 的 init launch，但需要
-  同步扩展 rank-barrier/K1 API，未在本轮扩大改动面。
+- 本轮实测过把 `k1_init_compact_routes_kernel` 并入 start
+  `rank_barrier_kernel`：精度 3/3 通过并消除了一个 launch，但端到端
+  从 1.945146 ms 变为 1.945905 ms（+0.0391%），处于噪声内且方向
+  不利，因此已完整回退，不进入最终源码。
 - 仓库及本测试 trace 中不存在用户提到的
   `moe_fused_gate_kernel_gourp1`；测试接收已生成的 top-k tensor。
   gate 与 pre-dispatch 融合需要上游路由组件共同修改，不能在
@@ -141,6 +174,8 @@ python -m pytest -q \
 ## 修改文件
 
 - `K1_fused/k1_fused_ext.cu`
+- `K1_fused/DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_`
+  `MT256X256X128_BF16_MEGAMOE_DISPATCH_PULL_L1_PACK5.s`
 - `K3_fused/k3_fused_ext.cu`
 - `tests/test_dcu_megamoe_v3.py`
 - 本报告
