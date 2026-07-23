@@ -1043,14 +1043,15 @@ def test_v3_capacity_contract_is_skew_safe_without_overflow_fallback():
     assert "skew_safe_compact_capacity_tiles" in k1_ext
     assert "const bool default_compact_prebuild = true" in k1_ext
     assert "int launch_wg_n = wg_n" in k1_ext
-    assert "hipMemcpyAsync(\n                &active_tiles_host" in k1_ext
-    assert "hipStreamSynchronize(stream)" in k1_ext
+    assert "hipMemcpyDeviceToHost" not in k1_ext
+    assert "hipStreamSynchronize(stream)" not in k1_ext
+    assert "route_scratch[active_tiles]" in k1_ext
     assert "prob.n = static_cast<uint32_t>(launch_rows)" in k1_ext
     assert "local_work_size) * wg_m * launch_wg_n" in k1_ext
     assert "int launch_wg_n = wg_n" in k3_normal_ext
-    assert "int active_tiles_host = wg_n" in k3_normal_ext
-    assert "hipMemcpyAsync(\n                &active_tiles_host" in k3_normal_ext
-    assert "hipStreamSynchronize(stream)" in k3_normal_ext
+    assert "hipMemcpyDeviceToHost" not in k3_normal_ext
+    assert "hipStreamSynchronize(stream)" not in k3_normal_ext
+    assert "ASM gate each row tile" in k3_normal_ext
     assert "const int launch_rows = launch_wg_n * 256" in k3_normal_ext
     assert "prob.n = static_cast<uint32_t>(launch_rows)" in k3_normal_ext
     assert "const int gemm_workgroups = wg_m * launch_wg_n" in k3_normal_ext
@@ -1121,7 +1122,7 @@ def test_v3_compact_routes_overwrite_zero_weight_reuse_slots():
     ).read_text(encoding="utf-8")
     count_kernel = k1_ext.split(
         "__global__ void k1_count_compact_routes_kernel(", 1
-    )[1].split("__global__ __launch_bounds__", 1)[0]
+    )[1].split("__global__ void k1_build_compact_tiles_kernel(", 1)[0]
     emit_kernel = k1_ext.split(
         "__global__ void k1_emit_compact_routes_kernel(", 1
     )[1].split("hipFunction_t get_asm_function", 1)[0]
@@ -1869,7 +1870,7 @@ def test_ygzp_int8_public_route_is_exact_eager_normal_compact_no_tail():
     assert "kDcuMegaMoeYgzpExperts / 8" in k3_ext
 
 
-def test_ygzp_int8_eager_reuses_exact_k1_active_tile_host_hint():
+def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
     formulas = load_opt_scratch_formula_namespace()
     expected_capacity_tiles = {
         512: 163,
@@ -1902,6 +1903,15 @@ def test_ygzp_int8_eager_reuses_exact_k1_active_tile_host_hint():
     assert "active_tiles host hint is available for INT8 K1 only" in k1_ext
     assert 'pybind11::arg("return_active_tiles_host_hint") = false' in k1_ext
     assert "if (return_active_tiles_host_hint)" in k1_ext
+    assert "active_tiles_host_hint = -1" in k1_ext
+    assert "hipMemcpyDeviceToHost" not in k1_ext
+    assert "hipStreamSynchronize(stream)" not in k1_ext
+    assert "k1_build_compact_tiles_kernel<<<1, 64" in k1_ext
+    assert "k1_init_compact_rows_kernel<<<row_init_blocks, row_init_threads" in k1_ext
+    assert "__shfl_up(inclusive_tiles, offset, 64)" in k1_ext
+    assert "min(inclusive_tiles, capacity_tiles)" in k1_ext
+    assert "std::min<int64_t>(" in k1_ext
+    assert "capacity_rows + kK1RowPointerPadding" in k1_ext
     assert "return_active_tiles_host_hint=int8_compute" in opt_3stage
     assert "active_tiles_host_hint," in opt_3stage
     assert (
@@ -1926,12 +1936,9 @@ def test_ygzp_int8_eager_reuses_exact_k1_active_tile_host_hint():
     assert "return_active_tiles_host_hint" not in k1_graph
 
     hint_branch = k3_ext.index("if (active_tiles_host_hint >= 0)")
-    fallback_copy = k3_ext.index("int active_tiles_host = wg_n", hint_branch)
-    assert hint_branch < fallback_copy
-    assert "active_tiles_host_hint < 0 && !stream_capturing" in k3_ext
     assert "active_tiles_host_hint is available for INT8 K3 only" in k3_ext
-    assert "hipMemcpyDeviceToHost" in k3_ext[fallback_copy:]
-    assert "hipStreamSynchronize(stream)" in k3_ext[fallback_copy:]
+    assert "hipMemcpyDeviceToHost" not in k3_ext[hint_branch:]
+    assert "hipStreamSynchronize(stream)" not in k3_ext[hint_branch:]
     assert "prob.active_tiles = active_tiles->data_ptr<int32_t>()" in k3_ext
     assert "active_tiles=k2_active_tiles" in opt_3stage
 

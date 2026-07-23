@@ -355,24 +355,10 @@ void launch_l2_deepgemm_original_asm(
                     "active_tiles must be int32");
         TORCH_CHECK(active_tiles->numel() >= 1,
                     "active_tiles must contain at least one int32");
-        if (active_tiles_host_hint < 0 && !stream_capturing &&
-            graph_runtime_offset_from_active_tiles == 0) {
-            int active_tiles_host = wg_n;
-            K3_HIP_CHECK(hipMemcpyAsync(
-                &active_tiles_host,
-                active_tiles->data_ptr<int32_t>(),
-                sizeof(int32_t),
-                hipMemcpyDeviceToHost,
-                stream));
-            K3_HIP_CHECK(hipStreamSynchronize(stream));
-            if (active_tiles_host < 0) {
-                active_tiles_host = 0;
-            }
-            if (active_tiles_host > wg_n) {
-                active_tiles_host = wg_n;
-            }
-            launch_wg_n = std::max(1, active_tiles_host);
-        }
+        // Without an already-known host hint, launch the capacity grid and let
+        // the ASM gate each row tile with this device pointer. This preserves
+        // stream ordering and avoids an eager D2H scalar read plus full-stream
+        // synchronization.
     }
     const int launch_rows = launch_wg_n * 256;
     const int gemm_workgroups = wg_m * launch_wg_n;

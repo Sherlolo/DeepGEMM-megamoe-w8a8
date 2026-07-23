@@ -554,8 +554,46 @@ __global__ void k1_count_compact_routes_kernel(
     }
 }
 
-__global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
+__global__ void k1_build_compact_tiles_kernel(
     int32_t* route_scratch_i32,
+    const int capacity_tiles,
+    const int local_experts) {
+    constexpr int kTileM = kK1RouteTileM;
+    const int tile_bases_offset = local_experts;
+    const int active_tiles_offset = 2 * local_experts;
+    const int tile_experts_offset = active_tiles_offset + 1;
+    const int expert = static_cast<int>(threadIdx.x);
+    int expert_tiles = 0;
+    if (expert < local_experts) {
+        expert_tiles =
+            (route_scratch_i32[expert] + kTileM - 1) / kTileM;
+    }
+    int inclusive_tiles = expert_tiles;
+#pragma unroll
+    for (int offset = 1; offset < 64; offset <<= 1) {
+        const int upstream = __shfl_up(inclusive_tiles, offset, 64);
+        if (expert >= offset) {
+            inclusive_tiles += upstream;
+        }
+    }
+    if (expert < local_experts) {
+        const int unclamped_base = inclusive_tiles - expert_tiles;
+        const int tile_base = min(unclamped_base, capacity_tiles);
+        const int tile_end = min(inclusive_tiles, capacity_tiles);
+        route_scratch_i32[tile_bases_offset + expert] = tile_base;
+        for (int tile = tile_base; tile < tile_end; ++tile) {
+            route_scratch_i32[tile_experts_offset + tile] = expert;
+        }
+        route_scratch_i32[expert] = 0;
+    }
+    if (expert == local_experts - 1) {
+        route_scratch_i32[active_tiles_offset] =
+            min(inclusive_tiles, capacity_tiles);
+    }
+}
+
+__global__ void k1_init_compact_rows_kernel(
+    const int32_t* route_scratch_i32,
     float* route_weights,
     int64_t* row_x_ptrs,
     int64_t* row_combine_ptrs,
@@ -567,33 +605,17 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
     const int runtime_limited_init,
     const int hidden) {
     constexpr int kTileM = kK1RouteTileM;
-    const int tile_bases_offset = local_experts;
     const int active_tiles_offset = 2 * local_experts;
     const int tile_experts_offset = active_tiles_offset + 1;
-    __shared__ int active_tiles_shared;
-    const int tid = static_cast<int>(threadIdx.x);
-    if (tid == 0) {
-        int total_tiles = 0;
-        for (int expert = 0; expert < local_experts; ++expert) {
-            route_scratch_i32[tile_bases_offset + expert] = total_tiles;
-            int tiles = (route_scratch_i32[expert] + kTileM - 1) / kTileM;
-            if (total_tiles + tiles > capacity_tiles) {
-                tiles = capacity_tiles > total_tiles ? capacity_tiles - total_tiles : 0;
-            }
-            for (int tile = 0; tile < tiles; ++tile) {
-                route_scratch_i32[tile_experts_offset + total_tiles + tile] = expert;
-            }
-            total_tiles += tiles;
-            route_scratch_i32[expert] = 0;
-        }
-        route_scratch_i32[active_tiles_offset] = total_tiles;
-        active_tiles_shared = total_tiles;
-    }
-    __syncthreads();
-    const int active_rows = active_tiles_shared * kTileM;
+    const int active_rows = route_scratch_i32[active_tiles_offset] * kTileM;
     const int capacity_rows = capacity_tiles * kTileM;
     const int init_rows = runtime_limited_init != 0 ? active_rows : capacity_rows;
-    for (int row = tid; row < init_rows; row += static_cast<int>(blockDim.x)) {
+    const int grid_threads =
+        static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    int row =
+        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+        static_cast<int>(threadIdx.x);
+    for (; row < init_rows; row += grid_threads) {
         const int tile_id = row / kTileM;
         const int expert =
             row < active_rows ? route_scratch_i32[tile_experts_offset + tile_id] : 0;
@@ -602,9 +624,11 @@ __global__ __launch_bounds__(1024) void k1_build_compact_tiles_kernel(
         route_weights[row] = 0.0f;
         m_indices[row] = expert >= 0 ? expert : 0;
     }
-    for (int row = tid;
+    row = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+          static_cast<int>(threadIdx.x);
+    for (;
          row < init_rows + static_cast<int>(kK1RowPointerPadding);
-         row += static_cast<int>(blockDim.x)) {
+         row += grid_threads) {
         const int sink_row = row < init_rows ? row : 0;
         row_combine_ptrs[row] = padding_combine_sink == nullptr
             ? 0
@@ -892,7 +916,25 @@ int64_t launch_l1_deepgemm_fused_asm(
             static_cast<int>(num_topk),
             hidden);
         K1_HIP_CHECK(hipGetLastError());
-        k1_build_compact_tiles_kernel<<<1, 1024, 0, stream>>>(
+        k1_build_compact_tiles_kernel<<<1, 64, 0, stream>>>(
+            reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
+            capacity_tiles,
+            local_experts);
+        K1_HIP_CHECK(hipGetLastError());
+        // Prefix construction is wave-local, while capacity-row
+        // initialization is bandwidth-oriented. Spread its independent
+        // writes across the device instead of constraining all rows to the
+        // prefix block's CU.
+        constexpr int row_init_threads = 256;
+        const int capacity_rows = capacity_tiles * kK1RouteTileM;
+        const int row_init_blocks = static_cast<int>(
+            std::min<int64_t>(
+                128,
+                ceil_div_i64(
+                    capacity_rows + kK1RowPointerPadding,
+                    row_init_threads)));
+        k1_init_compact_rows_kernel<<<row_init_blocks, row_init_threads, 0,
+                                      stream>>>(
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
             route_weights.data_ptr<float>(),
             row_x_ptrs.data_ptr<int64_t>(),
@@ -905,31 +947,10 @@ int64_t launch_l1_deepgemm_fused_asm(
             runtime_num_tokens == nullptr ? 0 : 1,
             hidden);
         K1_HIP_CHECK(hipGetLastError());
-        // Eager compact routing has already computed the exact active tile
-        // count. Copying this single int lets the ASM launch stay proportional
-        // to active compact rows while the backing buffers still keep the full
-        // skew-safe worst-case capacity. Graph capture cannot synchronize here,
-        // so graph keeps the conservative capacity launch.
-        if (runtime_num_tokens == nullptr && capacity_tiles > 128) {
-            int active_tiles_host = capacity_tiles;
-            const int active_tiles_offset = 2 * local_experts;
-            K1_HIP_CHECK(hipMemcpyAsync(
-                &active_tiles_host,
-                reinterpret_cast<int32_t*>(route_scratch.data_ptr()) +
-                    active_tiles_offset,
-                sizeof(int),
-                hipMemcpyDeviceToHost,
-                stream));
-            K1_HIP_CHECK(hipStreamSynchronize(stream));
-            if (active_tiles_host < 0) {
-                active_tiles_host = 0;
-            }
-            if (active_tiles_host > capacity_tiles) {
-                active_tiles_host = capacity_tiles;
-            }
-            active_tiles_host_hint = active_tiles_host;
-            launch_wg_n = std::max(1, active_tiles_host);
-        }
+        // Keep launch sizing host-asynchronous. The prebuilt compact ASM reads
+        // route_scratch[active_tiles] and terminates inactive row-tile
+        // workgroups before staging or GEMM work, matching the graph path
+        // without a device-to-host scalar read or stream synchronization.
         k1_emit_compact_routes_kernel<<<route_grid, route_threads, 0, stream>>>(
             static_cast<uint8_t*>(sym_buffer.data_ptr()),
             reinterpret_cast<int32_t*>(route_scratch.data_ptr()),
