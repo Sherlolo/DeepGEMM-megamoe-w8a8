@@ -1363,6 +1363,10 @@ s_load_dwordx2 s[98:99], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x1c
  * COMPUTE_ADDRESS_SCALE, so keep the pointer in s100:s101 until B offset
  * initialization. */
 s_load_dwordx2 s[100:101], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x24
+/* Compact active-tile pointer is passed directly in the launch kernarg.
+ * Loading it alongside the fixed arguments avoids a dependent
+ * DeviceUserArguments -> GpuProb+0xf8 pointer fetch in every capacity CTA. */
+s_load_dwordx2 s[90:91], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x44
 /* Grouped Gemm: Load address of kernel arguments */
 s_load_dwordx2 s[sgprKernArgAddress:sgprKernArgAddress+1], s[sgprKernArgAddress:sgprKernArgAddress+1], 0xc
 s_waitcnt lgkmcnt(0)
@@ -1376,8 +1380,6 @@ v_mov_b32 v[vgprSerial], v0                        // thread serial id
  * the generic prologue. */
 s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
 s_cbranch_scc1 .L_k1_active_tile_gate_done
-s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xf8
-s_waitcnt lgkmcnt(0)
 s_cmp_eq_u64 s[90:91], 0
 s_cbranch_scc1 .L_k1_active_tile_gate_done
 s_load_dword s88, s[90:91], 0x0
@@ -2353,7 +2355,7 @@ s_barrier
 
 s_mov_b32 s58, 5                                  // staging producer CTA count
 s_cmp_ge_u32 s10, 2
-s_cmov_b32 s58, 8
+s_cmov_b32 s58, 10
 s_cmp_lt_u32 s[sgprWorkGroup0], s58
 s_cbranch_scc0 label_SymmSliceDone
 s_mul_i32 s61, s[sgprWorkGroup0], 0x300           // slice start = wg0 * blockDim

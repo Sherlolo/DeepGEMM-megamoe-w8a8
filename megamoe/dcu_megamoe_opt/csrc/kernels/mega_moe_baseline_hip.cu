@@ -221,7 +221,7 @@ void mega_moe_pre_dispatch_fp8_channelwise_kernel(const uint16_t* __restrict__ x
     }
 }
 
-template <bool TopkIdxI64, bool TopkWeightsBf16>
+template <bool TopkIdxI64, bool TopkWeightsBf16, bool kInt8>
 __global__ __launch_bounds__(256)
 void mega_moe_pre_dispatch_fp8_channelwise_vec16_4096_kernel(
     const uint16_t* __restrict__ x_bf16,
@@ -295,23 +295,24 @@ void mega_moe_pre_dispatch_fp8_channelwise_vec16_4096_kernel(
     if (tid < 64)
         block_max = wave_reduce_max_64(block_max);
     if (tid == 0) {
-        row_scale = fmaxf(block_max, 1.0e-4f) / 448.0f;
+        constexpr float quant_max = kInt8 ? 127.0f : 448.0f;
+        row_scale = fmaxf(block_max, 1.0e-4f) / quant_max;
         out_scale[row] = row_scale;
     }
     __syncthreads();
 
     const float inv_scale = 1.0f / row_scale;
     uint32_t* out_vec = reinterpret_cast<uint32_t*>(out_fp8 + x_row_offset + col);
-    out_vec[0] = pack4_fp8_e4m3fn(
+    out_vec[0] = pack4_channelwise_quant<kInt8>(
         values[0] * inv_scale, values[1] * inv_scale,
         values[2] * inv_scale, values[3] * inv_scale);
-    out_vec[1] = pack4_fp8_e4m3fn(
+    out_vec[1] = pack4_channelwise_quant<kInt8>(
         values[4] * inv_scale, values[5] * inv_scale,
         values[6] * inv_scale, values[7] * inv_scale);
-    out_vec[2] = pack4_fp8_e4m3fn(
+    out_vec[2] = pack4_channelwise_quant<kInt8>(
         values[8] * inv_scale, values[9] * inv_scale,
         values[10] * inv_scale, values[11] * inv_scale);
-    out_vec[3] = pack4_fp8_e4m3fn(
+    out_vec[3] = pack4_channelwise_quant<kInt8>(
         values[12] * inv_scale, values[13] * inv_scale,
         values[14] * inv_scale, values[15] * inv_scale);
 }
@@ -622,22 +623,23 @@ void launch_mega_moe_pre_dispatch_channelwise_hip_impl(
 #define LAUNCH_PREDISPATCH_KERNEL(TOPK_I64, TOPK_W_BF16)                                      \
     do {                                                                                       \
         if (hidden == 4096) {                                                                   \
-            hipLaunchKernelGGL(                                                                \
-                (mega_moe_pre_dispatch_fp8_channelwise_wave4_4096_kernel<                     \
-                    TOPK_I64, TOPK_W_BF16, kInt8>),                                            \
-                dim3((rows + 3) / 4),                                                          \
-                block,                                                                         \
-                0,                                                                             \
-                stream,                                                                        \
-                static_cast<const uint16_t*>(x_bf16),                                          \
-                topk_idx,                                                                      \
-                topk_weights,                                                                  \
-                static_cast<uint8_t*>(out_fp8),                                                \
-                out_scale,                                                                     \
-                out_topk_idx,                                                                  \
-                out_topk_weights,                                                              \
-                rows,                                                                          \
-                topk);                                                                         \
+            if constexpr (kInt8) {                                                             \
+                hipLaunchKernelGGL(                                                            \
+                    (mega_moe_pre_dispatch_fp8_channelwise_vec16_4096_kernel<                  \
+                        TOPK_I64, TOPK_W_BF16, true>),                                         \
+                    grid, block, 0, stream,                                                    \
+                    static_cast<const uint16_t*>(x_bf16), topk_idx, topk_weights,              \
+                    static_cast<uint8_t*>(out_fp8), out_scale, out_topk_idx,                   \
+                    out_topk_weights, rows, topk);                                             \
+            } else {                                                                           \
+                hipLaunchKernelGGL(                                                            \
+                    (mega_moe_pre_dispatch_fp8_channelwise_wave4_4096_kernel<                  \
+                        TOPK_I64, TOPK_W_BF16, false>),                                        \
+                    dim3((rows + 3) / 4), block, 0, stream,                                   \
+                    static_cast<const uint16_t*>(x_bf16), topk_idx, topk_weights,              \
+                    static_cast<uint8_t*>(out_fp8), out_scale, out_topk_idx,                   \
+                    out_topk_weights, rows, topk);                                             \
+            }                                                                                  \
         } else {                                                                               \
             hipLaunchKernelGGL(                                                                \
                 (mega_moe_pre_dispatch_fp8_channelwise_kernel<                                 \

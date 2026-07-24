@@ -654,12 +654,21 @@ void launch_swiglu_quant_channelwise_auto(
     const int64_t active_tile_m) {
     const int hidden = static_cast<int>(x.size(1) / 2);
     if (hidden <= 2048 && !output_bf16) {
-        launch_swiglu_quant_channelwise<64, kFastMath, kInt8>(
-            x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
-            active_tiles,
-            out_fp8, out_scale, out_bf16,
-            output_bf16, has_clamp_value, clamp_value, max_row_blocks,
-            m_per_expert, local_experts, active_tile_m);
+        if constexpr (kInt8) {
+            launch_swiglu_quant_channelwise<128, kFastMath, kInt8>(
+                x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
+                active_tiles,
+                out_fp8, out_scale, out_bf16,
+                output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+                m_per_expert, local_experts, active_tile_m);
+        } else {
+            launch_swiglu_quant_channelwise<64, kFastMath, kInt8>(
+                x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,
+                active_tiles,
+                out_fp8, out_scale, out_bf16,
+                output_bf16, has_clamp_value, clamp_value, max_row_blocks,
+                m_per_expert, local_experts, active_tile_m);
+        }
     } else if (hidden <= 2048) {
         launch_swiglu_quant_channelwise<128, kFastMath, kInt8>(
             x, topk_weights, row_combine_ptrs, actual_m, actual_m_max,

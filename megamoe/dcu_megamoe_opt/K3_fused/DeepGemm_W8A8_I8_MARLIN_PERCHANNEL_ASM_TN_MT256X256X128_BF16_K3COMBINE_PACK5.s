@@ -13,7 +13,7 @@
 	.p2align 6
 	.amdhsa_kernel DeepGemm_W8A8_I8_PERCHANNEL_ASM_TN_MT256X256X128_BF16_K3COMBINE
 	  .amdhsa_user_sgpr_kernarg_segment_ptr 1
-	  .amdhsa_next_free_vgpr 255 // vgprs
+	  .amdhsa_next_free_vgpr 256 // vgprs
 	  .amdhsa_next_free_sgpr 102 // sgprs
 	  .amdhsa_group_segment_fixed_size 65536 // lds bytes
 	  .amdhsa_private_segment_fixed_size 0
@@ -189,7 +189,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .sgpr_count:                 102
     .sgpr_spill_count:           0
-    .vgpr_count:                 255
+    .vgpr_count:                 256
     .vgpr_spill_count:           0
     .wavefront_size:             64
 ...
@@ -1748,6 +1748,21 @@ s_load_dwordx2 s[98:99], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x1c
 s_load_dwordx2 s[sgprKernArgAddress:sgprKernArgAddress+1], s[sgprKernArgAddress:sgprKernArgAddress+1], 0xc
 s_waitcnt lgkmcnt(0)
 
+/* Reject inactive compact row tiles before grouped-GEMM parsing/remapping. */
+s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
+s_cbranch_scc1 .L_k3_entry_active_tile_gate_done
+s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
+s_waitcnt lgkmcnt(0)
+s_cmp_eq_u64 s[90:91], 0
+s_cbranch_scc1 .L_k3_entry_active_tile_gate_done
+s_load_dword s88, s[90:91], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshr_b32 s90, s[sgprWorkGroup0], 4
+s_cmp_ge_u32 s90, s88
+s_cbranch_scc0 .L_k3_entry_active_tile_gate_done
+s_endpgm
+.L_k3_entry_active_tile_gate_done:
+
 s_mov_b32 m0, 0x10000                              // LDS clamp at 65536 bytes
 v_mov_b32 v[vgprSerial], v0                        // thread serial id
 
@@ -1923,20 +1938,6 @@ label_EarlyStop_if_wg_exceed:
 s_endpgm
 label_NoEarlyStop_wgExceed:
 
-/* K3 graph bucket: skip row tiles beyond K1 compact runtime active tile count. */
-s_cmp_eq_u64 s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0
-s_cbranch_scc1 .L_k3_active_tile_gate_done
-s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xc8
-s_waitcnt lgkmcnt(0)
-s_cmp_eq_u64 s[90:91], 0
-s_cbranch_scc1 .L_k3_active_tile_gate_done
-s_load_dword s88, s[90:91], 0x0
-s_waitcnt lgkmcnt(0)
-s_cmp_ge_u32 s[sgprWorkGroup1], s88
-s_cbranch_scc0 .L_k3_active_tile_gate_done
-s_branch label_GW_End_20
-.L_k3_active_tile_gate_done:
-
 s_sub_u32 s[sgprAddressA+0], s[sgprAddressA+0], 16 // pre-pad to make room for possible pointer shift
 s_subb_u32 s[sgprAddressA+1], s[sgprAddressA+1], 0 // pre-pad to make room for possible pointer shift
 s_sub_u32 s[sgprAddressB+0], s[sgprAddressB+0], 16 // pre-pad to make room for possible pointer shift
@@ -1953,6 +1954,25 @@ label_LocalReadAddr:
 v_lshrrev_b32 v[vgprValuA_X0_I0], 6, v[vgprSerial]
 v_readfirstlane_b32 s[sgprWaveiD], v[vgprValuA_X0_I0]
 s_mov_b32 s[sgprMask], 0x10000
+
+/* K3COMBINE: compact routes form a dense prefix inside every 256-row tile.
+ * Read the first complete 64-bit destination pointer for this compute wave's
+ * 32-row slice. A zero pointer means the whole slice is padding, so its MMACs
+ * can be skipped while every load, LDS operation, wait and barrier remains.
+ * Use a coherent vector load because K1 populated the pointer table earlier
+ * on the same stream and scalar cache visibility is not guaranteed here. */
+v_mov_b32 v255, 1
+s_cmp_le_u32 s[sgprWaveiD], 7
+s_cbranch_scc0 .L_k3_wave_rowptr_ready
+s_lshl_b32 s64, s[sgprWorkGroup1], 8
+s_lshl_b32 s65, s[sgprWaveiD], 5
+s_add_u32 s64, s64, s65
+s_lshl_b32 s64, s64, 3
+s_load_dwordx2 s[88:89], s[sgprAddressD:sgprAddressD+1], s64
+s_waitcnt lgkmcnt(0)
+s_or_b32 s88, s88, s89
+v_mov_b32 v255, s88
+.L_k3_wave_rowptr_ready:
 
 /******************************************/
 /* Local Read Addresses                   */
@@ -2620,7 +2640,10 @@ ds_read_b128 v[vgprValuA_X0_I0+56:vgprValuA_X0_I0+59], v[vgprLocalReadAddrA] off
 ds_read_b128 v[vgprValuA_X0_I0+60:vgprValuA_X0_I0+63], v[vgprLocalReadAddrA] offset:30720 // L -> Reg lro=0 swapByteOffset=0 ti=16 vIdx=15 rIdx=0 buffer=1 iui=0
 
 s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32 vcc, 0, v255
+s_cbranch_vccnz .L_k3_skip_mac_0012_i0
 MAC_32x4x2_X0_I0
+.L_k3_skip_mac_0012_i0:
 s_barrier
 
 ds_read_b128 v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+3], v[vgprLocalReadAddrA] offset:1024 // L -> Reg lro=0 swapByteOffset=0 ti=16 vIdx=0 rIdx=0 buffer=1 iui=0
@@ -2650,7 +2673,10 @@ s_cmp_le_i32  s[sgprLoopCounterL], 2
 s_cmov_b32 s[sgprSrdB+2], 0
 s_cmov_b32 s[sgprGlobalReadIncsB+0], 0
 s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32 vcc, 0, v255
+s_cbranch_vccnz .L_k3_skip_mac_0012_i1
 MAC_32x4x2_X0_I1
+.L_k3_skip_mac_0012_i1:
 s_barrier
 
 s_waitcnt vmcnt(0)
@@ -2694,7 +2720,10 @@ ds_read_b128 v[vgprValuA_X0_I0+56:vgprValuA_X0_I0+59], v[vgprLocalReadAddrA] off
 ds_read_b128 v[vgprValuA_X0_I0+60:vgprValuA_X0_I0+63], v[vgprLocalReadAddrA] offset:63488 // L -> Reg lro=0 swapByteOffset=0 ti=16 vIdx=15 rIdx=0 buffer=1 iui=0
 
 s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32 vcc, 0, v255
+s_cbranch_vccnz .L_k3_skip_mac_0013_i0
 MAC_32x4x2_X1_I0
+.L_k3_skip_mac_0013_i0:
 s_barrier
 
 ds_read_b128 v[vgprValuA_X0_I0+0:vgprValuA_X0_I0+3], v[vgprLocalReadAddrA] offset:33792 // L -> Reg lro=0 swapByteOffset=0 ti=16 vIdx=0 rIdx=0 buffer=1 iui=0
@@ -2724,7 +2753,10 @@ s_cmp_le_i32  s[sgprLoopCounterL], 2
 s_cmov_b32 s[sgprSrdB+2], 0
 s_cmov_b32 s[sgprGlobalReadIncsB+0], 0
 s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32 vcc, 0, v255
+s_cbranch_vccnz .L_k3_skip_mac_0013_i1
 MAC_32x4x2_X1_I1
+.L_k3_skip_mac_0013_i1:
 s_barrier
 
 s_waitcnt vmcnt(0)
@@ -4547,7 +4579,10 @@ ds_read_b128 v[vgprValuA_X0_I0+56:vgprValuA_X0_I0+59], v[vgprLocalReadAddrA] off
 ds_read_b128 v[vgprValuA_X0_I0+60:vgprValuA_X0_I0+63], v[vgprLocalReadAddrA] offset:0x7800 // L -> Reg lro=0 swapByteOffset=0 ti=16 vIdx=15 rIdx=0 buffer=1 iui=0
 
 s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32 vcc, 0, v255
+s_cbranch_vccnz .L_k3_skip_tail_i0
 MAC_32x4x2_X0_I0
+.L_k3_skip_tail_i0:
 s_barrier
 
 
@@ -4568,7 +4603,10 @@ ds_read_b128 v[vgprValuA_X0_I0+52:vgprValuA_X0_I0+55], v[vgprLocalReadAddrA] off
 ds_read_b128 v[vgprValuA_X0_I0+56:vgprValuA_X0_I0+59], v[vgprLocalReadAddrA] offset:0x7400
 ds_read_b128 v[vgprValuA_X0_I0+60:vgprValuA_X0_I0+63], v[vgprLocalReadAddrA] offset:0x7c00
 s_waitcnt lgkmcnt(0)
+v_cmp_eq_u32 vcc, 0, v255
+s_cbranch_vccnz .L_k3_skip_tail_i1
 MAC_32x4x2_X0_I1
+.L_k3_skip_tail_i1:
 s_barrier
 
 /* closeLoop loopL finalLoop=1 tailLoop=1 */

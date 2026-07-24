@@ -346,7 +346,11 @@ struct __attribute__((packed)) KernelArgs {
     void* staged_x;
     int32_t* staged_flags;
     void* symm_base;
+    int32_t* active_tiles;
 };
+
+static_assert(offsetof(KernelArgs, active_tiles) == 0x44,
+              "K1 INT8 asm expects active_tiles at kernarg+0x44");
 
 struct LoadedAsmKernel {
     std::mutex mutex;
@@ -944,7 +948,9 @@ int64_t launch_l1_deepgemm_fused_asm(
             row_combine_ptrs.data_ptr<int64_t>(),
             row_x_scales.data_ptr<float>(),
             m_indices.data_ptr<int32_t>(),
-            reinterpret_cast<uint16_t*>(output.data_ptr()),
+            int8_compute
+                ? nullptr
+                : reinterpret_cast<uint16_t*>(output.data_ptr()),
             capacity_tiles,
             local_experts,
             runtime_num_tokens == nullptr ? 0 : 1,
@@ -1078,6 +1084,7 @@ int64_t launch_l1_deepgemm_fused_asm(
     args.staged_x = staged_x.data_ptr();
     args.staged_flags = staged_flags;
     args.symm_base = reinterpret_cast<void*>(symm_base_addr);
+    args.active_tiles = prob.active_tiles;
 
     const int local_work_size = 768;
     const size_t global_work_items =
