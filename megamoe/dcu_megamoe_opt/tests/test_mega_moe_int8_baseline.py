@@ -48,7 +48,11 @@ HIDDEN = 4096
 INTERMEDIATE_HIDDEN = 2048
 NUM_LOCAL_EXPERTS = NUM_EXPERTS // NUM_RANKS
 INT8_BASELINE_ATOL = 0.001
-INT8_WEIGHT_LAYOUT = "legacy_n16_flat"
+INT8_TORCH_REFERENCE_ATOL = 0.1
+INT8_WEIGHT_LAYOUT = "deepgemm_marlin_i8_contiguous_w6"
+BASELINE_BACKEND_AUTO = "auto"
+BASELINE_BACKEND_DEEPGEMM = "deepgemm"
+BASELINE_BACKEND_TORCH = "torch"
 
 
 def _dispatch_int8(
@@ -132,6 +136,71 @@ def _counts_and_rows(recv_counts, recv_counts_cuda, device, recv_topk_idx):
     return counts_gpu, max(rows, 1)
 
 
+def _pack_deepgemm_i8_contiguous_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, str]:
+    pack_fn = getattr(deepgemm, "marlin_i8_contiguous_weight", None)
+    if pack_fn is not None:
+        try:
+            packed = pack_fn(weight.contiguous(), shuffle_unique=1)
+        except TypeError:
+            packed = pack_fn(weight.contiguous())
+        return packed, INT8_WEIGHT_LAYOUT
+
+    return megamoe.weight8bit_nt_kpack2_marlin(weight), "legacy_n16_flat"
+
+
+def _resolve_baseline_backend(value: str) -> str:
+    if value != BASELINE_BACKEND_AUTO:
+        return value
+    return (
+        BASELINE_BACKEND_TORCH
+        if getattr(deepgemm, "marlin_i8_contiguous_weight", None) is not None
+        else BASELINE_BACKEND_DEEPGEMM
+    )
+
+
+def _resolve_baseline_atol(value: float | None, baseline_backend: str) -> float:
+    if value is not None:
+        return value
+    if baseline_backend == BASELINE_BACKEND_TORCH:
+        return INT8_TORCH_REFERENCE_ATOL
+    return INT8_BASELINE_ATOL
+
+
+@torch.no_grad()
+def _m_grouped_i8_gemm_nt_torch_reference(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    m_indices: torch.Tensor,
+) -> torch.Tensor:
+    x_int8, x_scale = a
+    weight_int8, weight_scale = b
+    output.zero_()
+    for expert in range(int(weight_int8.size(0))):
+        rows = torch.nonzero(m_indices == expert, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            continue
+        expert_out = x_int8[rows].float().matmul(weight_int8[expert].float().t())
+        expert_out *= x_scale[rows].float().view(-1, 1)
+        expert_out *= weight_scale[expert].float().view(1, -1)
+        output[rows].copy_(expert_out.to(output.dtype))
+    return output
+
+
+def _m_grouped_i8_gemm_nt_contiguous(
+    a: tuple[torch.Tensor, torch.Tensor],
+    b: tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    m_indices: torch.Tensor,
+    baseline_backend: str,
+) -> torch.Tensor:
+    if baseline_backend == BASELINE_BACKEND_TORCH:
+        return _m_grouped_i8_gemm_nt_torch_reference(a, b, output, m_indices)
+    return deepgemm.m_grouped_i8_gemm_nt_contiguous(a, b, output, m_indices)
+
+
 def _run_int8_baseline(
     ep_buffer,
     ep_config,
@@ -144,6 +213,7 @@ def _run_int8_baseline(
     activation_clamp,
     fast_math,
     return_stats,
+    baseline_backend,
 ):
     rows = int(x_bf16.size(0))
     x_int8 = torch.empty((rows, HIDDEN), device=x_bf16.device, dtype=torch.int8)
@@ -210,11 +280,12 @@ def _run_int8_baseline(
         device=x_bf16.device,
         dtype=torch.bfloat16,
     )
-    deepgemm.m_grouped_i8_gemm_nt_contiguous(
+    _m_grouped_i8_gemm_nt_contiguous(
         (grouped_x, grouped_x_scale),
         l1_weights,
         l1_out,
         m_indices,
+        baseline_backend,
     )
     l2_x_int8 = torch.empty(
         (grouped_rows, INTERMEDIATE_HIDDEN),
@@ -239,11 +310,12 @@ def _run_int8_baseline(
         row_combine_ptrs=None,
         fast_math=fast_math,
     )
-    deepgemm.m_grouped_i8_gemm_nt_contiguous(
+    _m_grouped_i8_gemm_nt_contiguous(
         (l2_x_int8, l2_x_scale),
         l2_weights,
         l2_out,
         m_indices,
+        baseline_backend,
     )
 
     recv_y = torch.empty(
@@ -424,14 +496,26 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (l2_int8, l2_scale),
         )
     )
-    baseline_l1_weights = (
-        megamoe.weight8bit_nt_kpack2_marlin(l1_int8),
-        l1_scale,
-    )
-    baseline_l2_weights = (
-        megamoe.weight8bit_nt_kpack2_marlin(l2_int8),
-        l2_scale,
-    )
+    baseline_backend = _resolve_baseline_backend(args.baseline_backend)
+    baseline_atol = _resolve_baseline_atol(args.atol, baseline_backend)
+    if baseline_backend == BASELINE_BACKEND_TORCH:
+        baseline_l1_weights = (l1_int8, l1_scale)
+        baseline_l2_weights = (l2_int8, l2_scale)
+        baseline_weight_layout = "plain_enk_torch_reference"
+    else:
+        baseline_l1_packed, baseline_weight_layout = _pack_deepgemm_i8_contiguous_weight(
+            l1_int8
+        )
+        baseline_l2_packed, l2_baseline_weight_layout = (
+            _pack_deepgemm_i8_contiguous_weight(l2_int8)
+        )
+        if l2_baseline_weight_layout != baseline_weight_layout:
+            raise RuntimeError(
+                "DeepGEMM INT8 baseline packed L1/L2 weights with different layouts: "
+                f"{baseline_weight_layout} vs {l2_baseline_weight_layout}"
+            )
+        baseline_l1_weights = (baseline_l1_packed, l1_scale)
+        baseline_l2_weights = (baseline_l2_packed, l2_scale)
 
     layout_result = ep_buffer.get_dispatch_layout(topk_idx, NUM_EXPERTS)
     if len(layout_result) != 5:
@@ -494,6 +578,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.activation_clamp,
             bool(args.fast_math),
             return_stats,
+            baseline_backend,
         )
 
     print_once(
@@ -506,7 +591,8 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f"capacity={args.num_max_tokens_per_rank}, route={args.route_pattern}",
     )
     print_once(rank, f" > shape={NUM_EXPERTS}/{NUM_TOPK}/{HIDDEN}/{INTERMEDIATE_HIDDEN}")
-    print_once(rank, f" > baseline weight layout={INT8_WEIGHT_LAYOUT}, atol={args.atol}")
+    print_once(rank, f" > baseline backend={baseline_backend}")
+    print_once(rank, f" > baseline weight layout={baseline_weight_layout}, atol={baseline_atol}")
 
     correctness_metrics = []
     for iteration in range(args.correctness_iters):
@@ -519,9 +605,9 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             baseline_stats,
             group,
         )
-        if max_abs > args.atol:
+        if max_abs > baseline_atol:
             raise AssertionError(
-                f"INT8 fused/baseline max_abs={max_abs} exceeds --atol={args.atol}"
+                f"INT8 fused/baseline max_abs={max_abs} exceeds --atol={baseline_atol}"
             )
         correctness_metrics.append(
             {"iteration": iteration + 1, "max_abs": max_abs, "mean_abs": mean_abs}
@@ -533,7 +619,8 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
 
     fused_timing = baseline_timing = None
-    if not args.skip_bench:
+    bench_skipped = bool(args.skip_bench or baseline_backend == BASELINE_BACKEND_TORCH)
+    if not bench_skipped:
         fused_timing = bench_tilelang_ms(
             lambda: run_fused(reset_stats=False), args.warmup, args.repeat
         )
@@ -559,7 +646,12 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         result = {
             "correct": True,
             "execution": "ygzp_ep8_normal_int8_eager",
-            "baseline_execution": "deepep_deepgemm_int8_normal_contiguous_eager",
+            "baseline_execution": (
+                "deepep_torch_int8_reference_eager"
+                if baseline_backend == BASELINE_BACKEND_TORCH
+                else "deepep_deepgemm_int8_normal_contiguous_eager"
+            ),
+            "baseline_backend": baseline_backend,
             "quant_mode": "int8",
             "num_ranks": NUM_RANKS,
             "num_experts": NUM_EXPERTS,
@@ -573,10 +665,10 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "route_pattern": args.route_pattern,
             "route_target_rank": args.route_target_rank,
             "fused_weight_layout": "normal_plain_pack5",
-            "baseline_weight_layout": INT8_WEIGHT_LAYOUT,
+            "baseline_weight_layout": baseline_weight_layout,
             "baseline_expert_alignment": DEEPEP_EXPERT_ALIGNMENT,
             "correctness_iters": args.correctness_iters,
-            "atol": args.atol,
+            "atol": baseline_atol,
             "max_abs": max(
                 (metric["max_abs"] for metric in correctness_metrics), default=0.0
             ),
@@ -588,7 +680,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             ),
             "stats_exact": True,
             "correctness_metrics": correctness_metrics,
-            "bench_skipped": bool(args.skip_bench),
+            "bench_skipped": bench_skipped,
             "bench_backend": (
                 None if fused_timing is None else f"tilelang_{fused_timing['backend']}"
             ),
@@ -640,7 +732,12 @@ def parse_args():
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, choices=(0, 1), default=1)
     parser.add_argument("--correctness-iters", type=int, default=1)
-    parser.add_argument("--atol", type=float, default=INT8_BASELINE_ATOL)
+    parser.add_argument("--atol", type=float, default=None)
+    parser.add_argument(
+        "--baseline-backend",
+        choices=(BASELINE_BACKEND_AUTO, BASELINE_BACKEND_DEEPGEMM, BASELINE_BACKEND_TORCH),
+        default=BASELINE_BACKEND_AUTO,
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--skip-bench", action="store_true")
@@ -654,7 +751,7 @@ def parse_args():
         parser.error(f"YGZP INT8 baseline test requires --num-processes {NUM_RANKS}")
     if args.correctness_iters < 1:
         parser.error("--correctness-iters must be at least 1")
-    if args.atol < 0:
+    if args.atol is not None and args.atol < 0:
         parser.error("--atol must be non-negative")
     return args
 

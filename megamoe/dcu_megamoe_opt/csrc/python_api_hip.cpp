@@ -1,17 +1,20 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <hip/hip_runtime.h>
+#if defined(DG_HIP_USE_HSA_FABRIC)
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #include <hsa/hsa_ext_gpu.h>
+#endif
 #include <torch/python.h>
 
+#if defined(DG_HIP_USE_HSA_FABRIC)
 #include <cstdlib>
-#include <cstring>
 #include <mutex>
+#endif
+#include <cstring>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "apis/mega_dcu.hpp"
@@ -34,6 +37,7 @@ static int g_mk_alignment = 1;
     } \
 } while (0)
 
+#if defined(DG_HIP_USE_HSA_FABRIC)
 #define DG_HSA_CHECK(expr) do { \
     const hsa_status_t status = (expr); \
     if (status != HSA_STATUS_SUCCESS) { \
@@ -135,6 +139,7 @@ static pybind11::bytes make_fabric_handle_bytes(void* ptr, const int64_t num_byt
     return pybind11::bytes(
         reinterpret_cast<const char*>(&handle), sizeof(hsa_ext_rpc_memory_t));
 }
+#endif
 
 static pybind11::bytes make_hip_ipc_handle_bytes(void* ptr) {
     hipIpcMemHandle_t handle{};
@@ -146,6 +151,11 @@ static pybind11::bytes get_hip_ipc_handle(const torch::Tensor& tensor) {
     TORCH_CHECK(tensor.is_cuda(), "HIP IPC handle requires a CUDA/HIP tensor");
     return make_hip_ipc_handle_bytes(reinterpret_cast<void*>(tensor.data_ptr()));
 }
+
+static pybind11::tuple allocate_hip_ipc_signal_buffer(const int64_t& num_bytes);
+static std::vector<int64_t> open_hip_ipc_handles(const std::vector<pybind11::bytes>& handles,
+                                                const int& local_rank);
+static void close_hip_ipc_handles(const std::vector<int64_t>& ptrs);
 
 static pybind11::tuple allocate_hip_ipc_buffer(const int64_t& num_bytes) {
     TORCH_CHECK(num_bytes > 0, "HIP IPC buffer size must be positive");
@@ -166,6 +176,7 @@ static pybind11::tuple allocate_hip_ipc_buffer(const int64_t& num_bytes) {
 }
 
 static pybind11::tuple allocate_hip_fabric_buffer(const int64_t& num_bytes) {
+#if defined(DG_HIP_USE_HSA_FABRIC)
     TORCH_CHECK(num_bytes > 0, "HIP fabric buffer size must be positive");
     const int64_t alloc_bytes = align_fabric_bytes(num_bytes);
     void* ptr = nullptr;
@@ -180,9 +191,13 @@ static pybind11::tuple allocate_hip_fabric_buffer(const int64_t& num_bytes) {
         tensor,
         reinterpret_cast<int64_t>(ptr),
         make_fabric_handle_bytes(ptr, alloc_bytes));
+#else
+    return allocate_hip_ipc_buffer(num_bytes);
+#endif
 }
 
 static pybind11::tuple allocate_hip_fabric_signal_buffer(const int64_t& num_bytes) {
+#if defined(DG_HIP_USE_HSA_FABRIC)
     TORCH_CHECK(num_bytes > 0, "HIP fabric signal buffer size must be positive");
     const int64_t alloc_bytes = align_fabric_bytes(num_bytes);
     void* ptr = nullptr;
@@ -192,6 +207,9 @@ static pybind11::tuple allocate_hip_fabric_signal_buffer(const int64_t& num_byte
     return pybind11::make_tuple(
         reinterpret_cast<int64_t>(ptr),
         make_fabric_handle_bytes(ptr, alloc_bytes));
+#else
+    return allocate_hip_ipc_signal_buffer(num_bytes);
+#endif
 }
 
 static pybind11::tuple allocate_hip_ipc_signal_buffer(const int64_t& num_bytes) {
@@ -209,6 +227,7 @@ static pybind11::tuple allocate_hip_ipc_signal_buffer(const int64_t& num_bytes) 
 
 static std::vector<int64_t> open_hip_fabric_handles(const std::vector<pybind11::bytes>& handles,
                                                    const int& local_rank) {
+#if defined(DG_HIP_USE_HSA_FABRIC)
     TORCH_CHECK(local_rank >= 0 && local_rank < static_cast<int>(handles.size()),
                 "local_rank is out of bounds for HIP fabric handles");
     const hsa_agent_t agent = get_current_device_agent();
@@ -229,6 +248,9 @@ static std::vector<int64_t> open_hip_fabric_handles(const std::vector<pybind11::
         ptrs[i] = reinterpret_cast<int64_t>(ptr);
     }
     return ptrs;
+#else
+    return open_hip_ipc_handles(handles, local_rank);
+#endif
 }
 
 static std::vector<int64_t> open_hip_ipc_handles(const std::vector<pybind11::bytes>& handles,
@@ -254,10 +276,14 @@ static std::vector<int64_t> open_hip_ipc_handles(const std::vector<pybind11::byt
 }
 
 static void close_hip_fabric_handles(const std::vector<int64_t>& ptrs) {
+#if defined(DG_HIP_USE_HSA_FABRIC)
     for (const auto ptr_value: ptrs) {
         if (ptr_value != 0)
             DG_HSA_CHECK(hsa_ext_rpc_memory_detach(reinterpret_cast<void*>(ptr_value)));
     }
+#else
+    close_hip_ipc_handles(ptrs);
+#endif
 }
 
 static void close_hip_ipc_handles(const std::vector<int64_t>& ptrs) {

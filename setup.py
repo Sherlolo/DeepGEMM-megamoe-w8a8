@@ -35,6 +35,7 @@ DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '0' if IS_HIP_EXTENSION else '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
+DG_HIP_USE_HSA_FABRIC = int(os.getenv('DG_HIP_USE_HSA_FABRIC', '0')) == 1
 MEGAMOE_DCU_ARCH = os.environ.get('MEGAMOE_DCU_ARCH', 'gfx938').strip().lower()
 if IS_HIP_EXTENSION and MEGAMOE_DCU_ARCH not in ('gfx936', 'gfx938'):
     raise ValueError(
@@ -61,6 +62,8 @@ if IS_HIP_EXTENSION:
     cxx_flags.append('-Wno-return-type')
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
+if IS_HIP_EXTENSION and DG_HIP_USE_HSA_FABRIC:
+    cxx_flags.append('-DDG_HIP_USE_HSA_FABRIC')
 hipcc_flags = list(cxx_flags)
 if IS_HIP_EXTENSION:
     hipcc_flags.append(f'--offload-arch={MEGAMOE_DCU_ARCH}')
@@ -82,7 +85,7 @@ if IS_HIP_EXTENSION:
         os.path.join(dcu_opt_root, 'csrc'),
         project_path('third-party', 'fmt', 'include'),
     ]
-    build_libraries = ['hsa-runtime64']
+    build_libraries = ['hsa-runtime64'] if DG_HIP_USE_HSA_FABRIC else []
     build_library_dirs = [f'{accelerator_home}/lib', f'{accelerator_home}/lib64']
 else:
     package_name = 'deep_gemm'
