@@ -18,6 +18,10 @@ static constexpr int kDcuMegaMoeYgzpExperts = 288;
 static constexpr int kDcuMegaMoeYgzpTopk = 8;
 static constexpr int kDcuMegaMoeYgzpHidden = 4096;
 static constexpr int kDcuMegaMoeYgzpIntermediate = 2048;
+static constexpr int kDcuMegaMoeFp8MaxLocalExperts = 64;
+static constexpr int kDcuMegaMoeFp8HiddenAlignment = 256;
+static constexpr int kDcuMegaMoeFp8IntermediateAlignment = 128;
+static constexpr int kDcuMegaMoeFp8MaxIntermediate = 4096;
 static constexpr int kDcuMegaMoeTailDoneCounterRingSlots = 16;
 static constexpr int kDcuMegaMoeTailCopyExpertDoneCount = 64;
 static constexpr int kDcuMegaMoeTailDoneCounterInts =
@@ -37,18 +41,32 @@ __host__ __device__ static inline bool dcu_supported_staged_local_experts(
            local_experts == 24 || local_experts == 32 || local_experts == 48;
 }
 
+__host__ __device__ static inline bool dcu_supported_staged_normal_local_experts(
+    const int local_experts) {
+    return local_experts > 0 &&
+           local_experts <= kDcuMegaMoeFp8MaxLocalExperts;
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_fp8_dims(
+    const int hidden,
+    const int intermediate_hidden) {
+    return hidden >= kDcuMegaMoeFp8HiddenAlignment &&
+           hidden % kDcuMegaMoeFp8HiddenAlignment == 0 &&
+           intermediate_hidden >= kDcuMegaMoeFp8IntermediateAlignment &&
+           intermediate_hidden <= kDcuMegaMoeFp8MaxIntermediate &&
+           intermediate_hidden % kDcuMegaMoeFp8IntermediateAlignment == 0 &&
+           static_cast<uint64_t>(hidden) *
+                   static_cast<uint64_t>(2 * intermediate_hidden) <=
+               UINT32_MAX;
+}
+
 __host__ __device__ static inline bool dcu_supported_staged_model_shape(
     const int num_experts,
     const int num_topk,
     const int hidden,
     const int intermediate_hidden) {
-    return num_topk == kDcuMegaMoeStagedTopk &&
-           ((num_experts == kDcuMegaMoeFlashExperts &&
-             hidden == kDcuMegaMoeFlashHidden &&
-             intermediate_hidden == kDcuMegaMoeFlashIntermediate) ||
-            (num_experts == kDcuMegaMoeProExperts &&
-             hidden == kDcuMegaMoeProHidden &&
-             intermediate_hidden == kDcuMegaMoeProIntermediate));
+    return num_experts > 0 && num_topk > 0 && num_topk <= num_experts &&
+           dcu_supported_staged_fp8_dims(hidden, intermediate_hidden);
 }
 
 __host__ __device__ static inline bool dcu_supported_staged_pack5_shape(
@@ -58,7 +76,10 @@ __host__ __device__ static inline bool dcu_supported_staged_pack5_shape(
     const int hidden,
     const int intermediate_hidden) {
     return dcu_supported_staged_ep_rank_count(num_ranks) &&
+           num_experts > 0 &&
            num_experts % num_ranks == 0 &&
+           dcu_supported_staged_normal_local_experts(
+               num_experts / num_ranks) &&
            dcu_supported_staged_model_shape(
                num_experts, num_topk, hidden, intermediate_hidden);
 }
@@ -77,10 +98,7 @@ __host__ __device__ static inline bool dcu_supported_staged_k1_shape(
 __host__ __device__ static inline bool dcu_supported_staged_k3_dims(
     const int hidden,
     const int intermediate_hidden) {
-    return (hidden == kDcuMegaMoeFlashHidden &&
-            intermediate_hidden == kDcuMegaMoeFlashIntermediate) ||
-           (hidden == kDcuMegaMoeProHidden &&
-           intermediate_hidden == kDcuMegaMoeProIntermediate);
+    return dcu_supported_staged_fp8_dims(hidden, intermediate_hidden);
 }
 
 __host__ __device__ static inline bool dcu_supported_staged_int8_normal_shape(
@@ -89,12 +107,26 @@ __host__ __device__ static inline bool dcu_supported_staged_int8_normal_shape(
     const int num_topk,
     const int hidden,
     const int intermediate_hidden) {
-    return num_ranks == 8 &&
-           num_experts == kDcuMegaMoeYgzpExperts &&
-           num_topk == kDcuMegaMoeYgzpTopk &&
-           hidden == kDcuMegaMoeYgzpHidden &&
-           intermediate_hidden == kDcuMegaMoeYgzpIntermediate &&
-           num_experts % num_ranks == 0;
+    const bool ygzp_shape =
+        num_experts == kDcuMegaMoeYgzpExperts &&
+        num_topk == kDcuMegaMoeYgzpTopk &&
+        hidden == kDcuMegaMoeYgzpHidden &&
+        intermediate_hidden == kDcuMegaMoeYgzpIntermediate;
+    const bool flash_shape =
+        num_experts == kDcuMegaMoeFlashExperts &&
+        num_topk == kDcuMegaMoeStagedTopk &&
+        hidden == kDcuMegaMoeFlashHidden &&
+        intermediate_hidden == kDcuMegaMoeFlashIntermediate;
+    return dcu_supported_staged_ep_rank_count(num_ranks) &&
+           num_experts % num_ranks == 0 &&
+           (flash_shape || ygzp_shape);
+}
+
+__host__ __device__ static inline bool dcu_supported_staged_int8_local_experts(
+    const int local_experts) {
+    return local_experts == 8 || local_experts == 9 ||
+           local_experts == 16 || local_experts == 18 ||
+           local_experts == 32 || local_experts == 36;
 }
 
 __host__ __device__ static inline bool dcu_supported_staged_int8_normal_k1_shape(
@@ -103,10 +135,10 @@ __host__ __device__ static inline bool dcu_supported_staged_int8_normal_k1_shape
     const int num_topk,
     const int hidden,
     const int l1_rows) {
-    return l1_rows == 2 * kDcuMegaMoeYgzpIntermediate &&
+    return l1_rows % 2 == 0 &&
            dcu_supported_staged_int8_normal_shape(
                num_ranks, num_experts, num_topk, hidden,
-               kDcuMegaMoeYgzpIntermediate);
+               l1_rows / 2);
 }
 
 __host__ __device__ static inline int64_t dcu_sym_buffer_ptrs_offset() {

@@ -1374,7 +1374,7 @@ s_waitcnt lgkmcnt(0)
 s_mov_b32 m0, 0x10000                              // LDS clamp at 65536 bytes
 v_mov_b32 v[vgprSerial], v0                        // thread serial id
 
-/* YGZP INT8 K1 has 4096 output features, hence 16 N workgroups per
+/* Staged INT8 K1 has 4096 output features, hence 16 N workgroups per
  * compact row tile. Gate the flat launch before grouped-GEMM argument
  * parsing and workgroup remapping so inactive capacity tiles do not consume
  * the generic prologue. */

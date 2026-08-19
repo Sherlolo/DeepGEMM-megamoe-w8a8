@@ -105,8 +105,7 @@ def _check_staged_pack5_shape(
         intermediate_hidden=intermediate_hidden,
     ):
         raise ValueError(
-            f"{STAGED_PACK5_SHAPE_CONTRACT}. "
-            "Add a shape-specific staged layout before enabling new model sizes."
+            STAGED_PACK5_SHAPE_CONTRACT
         )
 
 
@@ -470,7 +469,10 @@ def get_mega_moe_hip_build_config():
     )
     config["supported_staged_shape"] = STAGED_PACK5_SHAPE_CONTRACT
     config["supported_staged_capability"] = STAGED_V3_CAPABILITY_CONTRACT
-    config["int8_ygzp_path"] = "EP8 normal eager, signed W8A8, topk=8"
+    config["int8_normal_path"] = (
+        "DeepSeek-V4-Flash/YGZP EP8/EP16/EP32 normal eager, signed W8A8"
+    )
+    config["int8_ygzp_path"] = config["int8_normal_path"]
     config["cuda_graph_max_tokens_source"] = "requested num_max_tokens_per_rank"
     config["cuda_graph_execution"] = "graph=True captures the selected v3_staged backend"
     return config
@@ -889,7 +891,7 @@ def transform_int8_weights_for_mega_moe_normal(
     l1_scale: Optional[torch.Tensor] = None,
     l2_scale: Optional[torch.Tensor] = None,
 ):
-    """Prepare YGZP signed-INT8 weights for the normal fused PACK5 path."""
+    """Prepare signed-INT8 weights for the normal fused PACK5 path."""
     l1_int8, l1_scale_out = _prepare_grouped_int8_weight(
         l1_weights, l1_scale, name="l1_weights"
     )
@@ -1146,14 +1148,14 @@ def int8_mega_moe(
     graph: bool = False,
     capacity_num_tokens: Optional[int] = None,
 ) -> None:
-    """Run the YGZP EP8 normal eager signed-INT8 W8A8 path."""
+    """Run the normal eager signed-INT8 W8A8 path."""
     v3_backend = normalize_v3_backend(megamoe_backend)
     if v3_backend != V3_BACKEND_NORMAL:
-        raise NotImplementedError("YGZP INT8 supports megamoe_backend='normal' only")
+        raise NotImplementedError("INT8 supports megamoe_backend='normal' only")
     if graph:
-        raise NotImplementedError("YGZP INT8 CUDA Graph capture is not implemented")
+        raise NotImplementedError("INT8 CUDA Graph capture is not implemented")
     if _is_current_stream_capturing():
-        raise RuntimeError("YGZP INT8 currently supports eager execution only")
+        raise RuntimeError("INT8 currently supports eager execution only")
     if normalize_v3_quant(
         getattr(sym_buffer, "quant_mode", V3_QUANT_FP8)
     ) != V3_QUANT_INT8:
@@ -1163,12 +1165,12 @@ def int8_mega_moe(
     if activation != "swiglu":
         raise ValueError("DCU W8A8 MegaMoE supports swiglu only")
     if y.dim() != 2 or y.dtype != torch.bfloat16:
-        raise ValueError("YGZP INT8 output workspace y must be 2D BF16")
+        raise ValueError("INT8 output workspace y must be 2D BF16")
 
     l1_weights, l1_layout = _select_v3_weight_layout(l1_weights, v3_backend)
     l2_weights, l2_layout = _select_v3_weight_layout(l2_weights, v3_backend)
     if l1_layout != "normal" or l2_layout != "normal":
-        raise NotImplementedError("YGZP INT8 supports normal PACK5 weights only")
+        raise NotImplementedError("INT8 supports normal PACK5 weights only")
     intermediate_hidden = int(l1_weights[1].size(1) // 2)
     if not staged_v3_capability_supported(
         quant=V3_QUANT_INT8,

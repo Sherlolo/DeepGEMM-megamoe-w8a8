@@ -2322,6 +2322,8 @@ s_barrier
 s_mov_b32 s58, 5                                  // staging producer CTA count
 s_cmp_ge_u32 s10, 2
 s_cmov_b32 s58, 8
+s_cmp_lt_u32 s[sgprNumWorkGroups0], s58
+s_cmov_b32 s58, s[sgprNumWorkGroups0]             // small intermediate: use every available N CTA
 s_cmp_lt_u32 s[sgprWorkGroup0], s58
 s_cbranch_scc0 label_SymmSliceDone
 s_mul_i32 s61, s[sgprWorkGroup0], 0x300           // slice start = wg0 * blockDim
@@ -2332,20 +2334,26 @@ label_SymmStageLoop:
 v_cmp_lt_u32 vcc, v250, s60
 s_and_saveexec_b64 s[90:91], vcc
 s_cbranch_execz label_SymmSliceDone
-s_cmp_eq_u32 s[sgprSizeL], 4096
-s_cbranch_scc0 label_SymmStageProIndex
-v_lshrrev_b32 v251, 7, v250                       // Flash row in 256-row tile
-v_and_b32 v252, 127, v250                         // Flash 32-byte vector index in row
-s_branch label_SymmStageIndexDone
-label_SymmStageProIndex:
-v_lshrrev_b32 v251, 5, v250                       // Pro: divide vector index by 32
-s_mov_b32 s63, 9363                               // exact /7 for q <= 1791
-v_mul_lo_u32 v251, s63, v251
-v_lshrrev_b32 v251, 16, v251                      // row = vec / 224
-s_mov_b32 s63, 224                                // Pro row stride in 32-byte vectors
-v_mul_lo_u32 v252, s63, v251                      // row start vector
-v_sub_u32 v252, v250, v252                        // Pro 32-byte vector index in row
-label_SymmStageIndexDone:
+/* Runtime hidden stride. Convert the linear 32-byte vector index into
+ * {row, column-vector}; quotient correction makes the reciprocal estimate
+ * exact at row boundaries for every supported hidden multiple of 128. */
+s_lshr_b32 s63, s[sgprSizeL], 5                   // hidden / 32 vectors per row
+v_cvt_f32_u32 v251, s63
+v_rcp_iflag_f32 v251, v251
+v_cvt_f32_u32 v252, v250
+v_mul_f32 v251, v251, v252
+v_cvt_u32_f32 v251, v251                          // approximate row
+v_mul_lo_u32 v254, s63, v251
+v_cmp_gt_u32 vcc, v254, v250
+v_sub_u32 v253, v251, 1
+v_cndmask_b32 v251, v251, v253, vcc               // correct an overestimate
+v_mul_lo_u32 v254, s63, v251
+v_sub_u32 v252, v250, v254                        // candidate column-vector
+v_cmp_ge_u32 vcc, v252, s63
+v_add_u32 v253, 1, v251
+v_sub_u32 v254, v252, s63
+v_cndmask_b32 v251, v251, v253, vcc               // correct an underestimate
+v_cndmask_b32 v252, v252, v254, vcc
 v_lshlrev_b32 v253, 3, v251
 ds_read_b64 v[253:254], v253, offset:0
 s_waitcnt lgkmcnt(0)
@@ -2402,13 +2410,7 @@ v_mov_b32 v239, 0
 label_SymmStageZeroFillDone:
 s_mov_b64 exec, s[54:55]
 v_add_u32 v251, s56, v251                         // global staged row
-s_cmp_eq_u32 s[sgprSizeL], 4096
-s_cbranch_scc0 label_SymmStageStoreDynamicStride
-v_lshlrev_b32 v251, 12, v251
-s_branch label_SymmStageStoreStrideDone
-label_SymmStageStoreDynamicStride:
 v_mul_lo_u32 v251, s[sgprSizeL], v251              // global staged row * hidden
-label_SymmStageStoreStrideDone:
 v_add_u32 v251, v251, v252
 buffer_store_dwordx4 v[232:235], v251, s[64:67], 0, offen, offset:0
 v_add_u32 v251, 16, v251

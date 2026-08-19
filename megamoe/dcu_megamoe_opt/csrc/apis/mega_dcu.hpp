@@ -34,7 +34,11 @@ static pybind11::dict get_mega_moe_hip_build_config() {
     config["has_fp4_api"] = false;
     config["int8_operator"] = "int8_w8a8_mega_moe";
     config["int8_capability"] =
-        "YGZP EP8 normal eager experts=288 topk=8 hidden=4096 intermediate=2048";
+        "normal eager DeepSeek-V4-Flash/YGZP on EP8/EP16/EP32";
+    config["fp8_capability"] =
+        "normal dynamic experts/topk/hidden/intermediate with at most 64 local "
+        "experts, aligned dimensions, and intermediate<=4096; LL remains "
+        "Flash/Pro specialized";
     config["int8_quantization"] =
         "signed symmetric per-token activation and per-output-channel weight scales";
     config["fusion_boundary"] = "dispatch_pool_l1_swiglu_quant_l2_combine";
@@ -299,17 +303,16 @@ static int64_t get_mega_moe_route_scratch_size_for_mega_moe(
     const bool fp8_pack5_shape =
         !use_int8_dispatch && dcu_supported_staged_pack5_shape(
             num_ranks, num_experts, num_topk, hidden, intermediate_hidden);
-    const bool ygzp_int8_normal_ep8_shape =
+    const bool int8_normal_shape =
         use_int8_dispatch && !enable_ll_scratch &&
         dcu_supported_staged_int8_normal_shape(
             num_ranks, num_experts, num_topk, hidden, intermediate_hidden);
     TORCH_CHECK(
-        fp8_pack5_shape || ygzp_int8_normal_ep8_shape,
-        "DCU MegaMoE route_scratch supports FP8 DeepSeek-V4-Flash "
-        "EP8/EP16/EP32 experts=256 topk=6 hidden=4096 intermediate=2048 "
-        "and DeepSeek-V4-Pro EP8/EP16/EP32 experts=384 topk=6 hidden=7168 "
-        "intermediate=3072; or INT8 YGZP normal-only EP8 experts=288 topk=8 "
-        "hidden=4096 intermediate=2048");
+        fp8_pack5_shape || int8_normal_shape,
+        "DCU MegaMoE route_scratch supports FP8 positive experts divisible by "
+        "EP8/EP16/EP32 with at most 64 local experts, topk in [1, experts], "
+        "hidden divisible by 256, intermediate divisible by 128 and <=4096; or INT8 "
+        "DeepSeek-V4-Flash/YGZP normal-only EP8/EP16/EP32");
 
     constexpr int64_t kK1RouteTileM = 256;
     constexpr int64_t kK1LlRowTile = 64;

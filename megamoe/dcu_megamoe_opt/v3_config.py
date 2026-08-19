@@ -20,6 +20,10 @@ _VALID_BACKEND_MODES = {V3_BACKEND_AUTO, V3_BACKEND_LL, V3_BACKEND_NORMAL}
 _VALID_V3_QUANTS = {V3_QUANT_FP8, V3_QUANT_INT8}
 
 SUPPORTED_STAGED_EP_RANKS = (8, 16, 32)
+STAGED_FP8_MAX_LOCAL_EXPERTS = 64
+STAGED_FP8_HIDDEN_ALIGNMENT = 256
+STAGED_FP8_INTERMEDIATE_ALIGNMENT = 128
+STAGED_FP8_MAX_INTERMEDIATE = 4096
 
 DEEPSEEK_V4_FLASH_SHAPE = (256, 6, 4096, 2048)
 DEEPSEEK_V4_PRO_SHAPE = (384, 6, 7168, 3072)
@@ -28,25 +32,21 @@ STAGED_PACK5_MODEL_SHAPES = {
     "DeepSeek-V4-Flash": DEEPSEEK_V4_FLASH_SHAPE,
     "DeepSeek-V4-Pro": DEEPSEEK_V4_PRO_SHAPE,
 }
-STAGED_PACK5_LOCAL_EXPERTS = tuple(
-    sorted(
-        {
-            num_experts // num_ranks
-            for num_experts, _, _, _ in STAGED_PACK5_MODEL_SHAPES.values()
-            for num_ranks in SUPPORTED_STAGED_EP_RANKS
-        }
-    )
-)
+STAGED_INT8_NORMAL_MODEL_SHAPES = {
+    "DeepSeek-V4-Flash-INT8": DEEPSEEK_V4_FLASH_SHAPE,
+    "YGZP-INT8": YGZP_INT8_SHAPE,
+}
+STAGED_PACK5_LOCAL_EXPERTS = tuple(range(1, STAGED_FP8_MAX_LOCAL_EXPERTS + 1))
 STAGED_PACK5_SHAPE_CONTRACT = (
-    "DCU MegaMoE staged LL/normal pack5 path supports "
-    "DeepSeek-V4-Flash EP8/EP16/EP32 experts=256 topk=6 hidden=4096 "
-    "intermediate=2048 and DeepSeek-V4-Pro EP8/EP16/EP32 experts=384 "
-    "topk=6 hidden=7168 intermediate=3072"
+    "DCU MegaMoE staged normal FP8 pack5 path supports EP8/EP16/EP32, "
+    "positive experts divisible by EP ranks with at most 64 local experts, "
+    "topk in [1, experts], hidden divisible by 256, "
+    "intermediate divisible by 128 and in [128, 4096]; the LL path remains "
+    "specialized for DeepSeek-V4-Flash/Pro"
 )
 
-# This registry is deliberately separate from STAGED_PACK5_MODEL_SHAPES.  The
-# latter describes the legacy FP8 shape/layout whitelist, while this one is the
-# exact execution capability gate used by quant-aware dispatch.
+# This registry retains the exact LL FP8 and normal INT8 capabilities. Normal
+# FP8 uses the aligned runtime-dimension gate in staged_v3_capability_supported.
 STAGED_V3_MODEL_CAPABILITIES = {
     "DeepSeek-V4-Flash": {
         "shape": DEEPSEEK_V4_FLASH_SHAPE,
@@ -60,17 +60,21 @@ STAGED_V3_MODEL_CAPABILITIES = {
         "backends": (V3_BACKEND_LL, V3_BACKEND_NORMAL),
         "ep_ranks": SUPPORTED_STAGED_EP_RANKS,
     },
-    "YGZP-INT8": {
-        "shape": YGZP_INT8_SHAPE,
-        "quant": V3_QUANT_INT8,
-        "backends": (V3_BACKEND_NORMAL,),
-        "ep_ranks": (8,),
+    **{
+        name: {
+            "shape": shape,
+            "quant": V3_QUANT_INT8,
+            "backends": (V3_BACKEND_NORMAL,),
+            "ep_ranks": SUPPORTED_STAGED_EP_RANKS,
+        }
+        for name, shape in STAGED_INT8_NORMAL_MODEL_SHAPES.items()
     },
 }
 STAGED_V3_CAPABILITY_CONTRACT = (
-    "DCU MegaMoE staged V3 supports FP8 DeepSeek-V4-Flash/Pro LL or normal "
-    "on EP8/EP16/EP32, and INT8 YGZP normal on EP8 with experts=288 topk=8 "
-    "hidden=4096 intermediate=2048"
+    "DCU MegaMoE staged V3 supports dynamic FP8 experts/topk and aligned "
+    "hidden/intermediate on the normal backend with at most 64 local experts, "
+    "FP8 DeepSeek-V4-Flash/Pro on LL, and INT8 DeepSeek-V4-Flash/YGZP "
+    "normal on EP8/EP16/EP32"
 )
 
 
@@ -114,7 +118,21 @@ def normal_ll_token_threshold(value: str | int | None = None) -> int:
     return threshold
 
 
-def staged_pack5_model_shape_supported(
+def staged_pack5_dims_supported(*, hidden: int, intermediate_hidden: int) -> bool:
+    hidden = int(hidden)
+    intermediate = int(intermediate_hidden)
+    return (
+        hidden >= STAGED_FP8_HIDDEN_ALIGNMENT
+        and hidden % STAGED_FP8_HIDDEN_ALIGNMENT == 0
+        and STAGED_FP8_INTERMEDIATE_ALIGNMENT
+        <= intermediate
+        <= STAGED_FP8_MAX_INTERMEDIATE
+        and intermediate % STAGED_FP8_INTERMEDIATE_ALIGNMENT == 0
+        and hidden * (2 * intermediate) <= 0xFFFFFFFF
+    )
+
+
+def staged_pack5_legacy_model_shape_supported(
     *,
     num_experts: int,
     num_topk: int,
@@ -130,6 +148,25 @@ def staged_pack5_model_shape_supported(
     return shape in STAGED_PACK5_MODEL_SHAPES.values()
 
 
+def staged_pack5_model_shape_supported(
+    *,
+    num_experts: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+) -> bool:
+    experts = int(num_experts)
+    topk = int(num_topk)
+    return (
+        experts > 0
+        and 0 < topk <= experts
+        and staged_pack5_dims_supported(
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+        )
+    )
+
+
 def staged_pack5_shape_supported(
     *,
     num_ranks: int,
@@ -142,7 +179,9 @@ def staged_pack5_shape_supported(
     experts = int(num_experts)
     return (
         ranks in SUPPORTED_STAGED_EP_RANKS
+        and experts > 0
         and experts % ranks == 0
+        and 0 < experts // ranks <= STAGED_FP8_MAX_LOCAL_EXPERTS
         and staged_pack5_model_shape_supported(
             num_experts=experts,
             num_topk=num_topk,
@@ -162,7 +201,7 @@ def staged_v3_capability_supported(
     hidden: int,
     intermediate_hidden: int,
 ) -> bool:
-    """Return whether an exact quant/backend/EP/model-shape combination exists."""
+    """Return whether a quant/backend/EP/model-shape combination is executable."""
 
     quant_mode = str(quant).strip().lower()
     backend_mode = str(backend).strip().lower()
@@ -182,6 +221,14 @@ def staged_v3_capability_supported(
         int(hidden),
         int(intermediate_hidden),
     )
+    if quant_mode == V3_QUANT_FP8 and backend_mode == V3_BACKEND_NORMAL:
+        return staged_pack5_shape_supported(
+            num_ranks=ranks,
+            num_experts=experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+        )
     return any(
         shape == capability["shape"]
         and quant_mode == capability["quant"]
@@ -201,7 +248,7 @@ def staged_v3_capability_local_experts(
     hidden: int,
     intermediate_hidden: int,
 ) -> int:
-    """Return local experts only after the exact execution gate succeeds."""
+    """Return local experts only after the execution capability gate succeeds."""
 
     if not staged_v3_capability_supported(
         quant=quant,
@@ -236,7 +283,7 @@ def staged_pack5_local_experts(
 
 
 def staged_pack5_local_experts_supported(local_experts: int) -> bool:
-    return int(local_experts) in STAGED_PACK5_LOCAL_EXPERTS
+    return 0 < int(local_experts) <= STAGED_FP8_MAX_LOCAL_EXPERTS
 
 
 def staged_pack5_k1_shape_supported(
@@ -261,9 +308,9 @@ def staged_pack5_k1_shape_supported(
 
 
 def staged_pack5_k3_dims_supported(*, hidden: int, intermediate_hidden: int) -> bool:
-    return any(
-        int(hidden) == shape_hidden and int(intermediate_hidden) == shape_intermediate
-        for _, _, shape_hidden, shape_intermediate in STAGED_PACK5_MODEL_SHAPES.values()
+    return staged_pack5_dims_supported(
+        hidden=hidden,
+        intermediate_hidden=intermediate_hidden,
     )
 
 

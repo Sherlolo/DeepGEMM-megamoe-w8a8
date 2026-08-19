@@ -116,7 +116,14 @@ struct __attribute__((packed)) KernelArgs {
     uint32_t gsu;
     int32_t* m_indics;
     int32_t* row_combine_ptrs_i32;
+    int32_t* active_tiles;
+    uint32_t n_workgroups_per_tile;
 };
+
+static_assert(offsetof(KernelArgs, active_tiles) == 0x2c,
+              "K3 asm expects active_tiles at kernarg+0x2c");
+static_assert(offsetof(KernelArgs, n_workgroups_per_tile) == 0x34,
+              "K3 asm expects n_workgroups_per_tile at kernarg+0x34");
 
 struct LoadedAsmKernel {
     std::mutex mutex;
@@ -239,21 +246,24 @@ void launch_l2_deepgemm_original_asm(
     TORCH_CHECK(total_rows > 0 && total_rows % 256 == 0,
                 "K3 asm expects rows padded to a 256-row tile");
     TORCH_CHECK(deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, k),
-                "current K3 asm path supports DeepSeek-V4-Flash "
-                "(hidden=4096, intermediate=2048) and DeepSeek-V4-Pro "
-                "(hidden=7168, intermediate=3072)");
+                "K3 FP8 asm requires hidden divisible by 256, intermediate "
+                "divisible by 128 and <=4096, and a uint32-compatible weight stride");
+    TORCH_CHECK(static_cast<uint64_t>(total_rows) * hidden <= UINT32_MAX &&
+                    static_cast<uint64_t>(total_rows) * k <= UINT32_MAX &&
+                    static_cast<uint64_t>(hidden) * k <= UINT32_MAX,
+                "K3 asm strides must fit in uint32");
     TORCH_CHECK(l2_scale.dim() == 2 &&
                     l2_scale.size(0) > 0 &&
                     l2_scale.size(1) == hidden,
                 "invalid L2 scale shape");
     const int local_experts = static_cast<int>(l2_scale.size(0));
     if (int8_compute) {
-        TORCH_CHECK(hidden == deep_gemm::mega::kDcuMegaMoeYgzpHidden &&
-                        k == deep_gemm::mega::kDcuMegaMoeYgzpIntermediate &&
-                        local_experts ==
-                            deep_gemm::mega::kDcuMegaMoeYgzpExperts / 8,
-                    "INT8 K3 supports only YGZP EP8 "
-                    "(hidden=4096, intermediate=2048, local_experts=36)");
+        TORCH_CHECK(
+            hidden == deep_gemm::mega::kDcuMegaMoeFlashHidden &&
+                k == deep_gemm::mega::kDcuMegaMoeFlashIntermediate &&
+                deep_gemm::mega::dcu_supported_staged_int8_local_experts(
+                    local_experts),
+            "INT8 K3 supports staged normal DeepSeek-V4-Flash/YGZP shapes");
     }
     if (weight_pack5_layout) {
         TORCH_CHECK(
@@ -314,7 +324,7 @@ void launch_l2_deepgemm_original_asm(
         TORCH_CHECK(reduce_hidden == hidden &&
                         deep_gemm::mega::dcu_supported_staged_k3_dims(hidden, k) &&
                         reduce_num_topk == deep_gemm::mega::kDcuMegaMoeStagedTopk,
-                    "asm tail reduce currently supports Flash/Pro hidden sizes and topk=6");
+                    "asm tail reduce requires aligned FP8 dimensions and topk=6");
         TORCH_CHECK(asm_reduce_y->dim() == 2 &&
                         asm_reduce_y->size(0) == reduce_num_tokens &&
                         asm_reduce_y->size(1) == reduce_hidden,
@@ -337,8 +347,6 @@ void launch_l2_deepgemm_original_asm(
     const int wg_n = (total_rows + 255) / 256;
     int launch_wg_n = wg_n;
     if (active_tiles_host_hint >= 0) {
-        TORCH_CHECK(int8_compute,
-                    "active_tiles_host_hint is available for INT8 K3 only");
         TORCH_CHECK(active_tiles != nullptr,
                     "active_tiles_host_hint requires device active_tiles");
         TORCH_CHECK(!stream_capturing,
@@ -481,6 +489,8 @@ void launch_l2_deepgemm_original_asm(
     args.row_combine_ptrs_i32 = row_combine_ptrs == nullptr
         ? nullptr
         : reinterpret_cast<int32_t*>(row_combine_ptrs->data_ptr<int64_t>());
+    args.active_tiles = prob.active_tiles;
+    args.n_workgroups_per_tile = static_cast<uint32_t>(wg_m);
 
     const int local_work_size = 768;
     const int reduce_workgroups = static_cast<int>(prob.asm_reduce_blocks);

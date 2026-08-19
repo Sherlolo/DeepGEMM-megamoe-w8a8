@@ -47,7 +47,7 @@ def ensure_k3_combine_pack5_asm_code_object(
             raise ValueError("INT8 K3 does not support the unified weight layout")
         return _ensure_prebuilt_code_object(
             K3_COMBINE_INT8_PACK5_ASM_CO,
-            "K3 YGZP INT8 pack5 combine",
+            "K3 INT8 pack5 combine",
         )
     co = (
         K3_COMBINE_UNIFIED_PACK5_ASM_CO
@@ -280,8 +280,6 @@ def k3_l2_fused_v3_to_combine(
             raise NotImplementedError(
                 "INT8 K3 uses no-tail combine followed by generic reduction"
             )
-    if active_tiles_host_hint is not None and quant_mode != V3_QUANT_INT8:
-        raise ValueError("active_tiles_host_hint is available for INT8 K3 only")
     if sym_buffer is None and asm_signal_addrs is not None:
         raise ValueError("V3 K3 no-tail path must not receive peer signal tensors")
     if asm_signal_num_ranks or asm_signal_generation:

@@ -1,8 +1,8 @@
-"""YGZP EP8 eager-normal INT8 MegaMoE versus true INT8 baseline.
+"""Eager-normal INT8 MegaMoE versus true INT8 baseline.
 
 This executable test is intentionally separate from ``test_mega_moe_dcu.py``.
-It supports only the YGZP shape and compares the fused signed-INT8 path with a
-DeepEP + DeepGEMM signed-INT8 normal-contiguous baseline.
+It compares the fused signed-INT8 path with a DeepEP + DeepGEMM or torch
+signed-INT8 normal-contiguous baseline.
 """
 
 import argparse
@@ -47,12 +47,38 @@ NUM_TOPK = 8
 HIDDEN = 4096
 INTERMEDIATE_HIDDEN = 2048
 NUM_LOCAL_EXPERTS = NUM_EXPERTS // NUM_RANKS
+MODEL_SHAPE_DEFAULT = "ygzp"
+MODEL_SHAPES = {
+    "ygzp": (288, 8, 4096, 2048),
+    "flash": (256, 6, 4096, 2048),
+}
 INT8_BASELINE_ATOL = 0.001
 INT8_TORCH_REFERENCE_ATOL = 0.1
 INT8_WEIGHT_LAYOUT = "deepgemm_marlin_i8_contiguous_w6"
 BASELINE_BACKEND_AUTO = "auto"
 BASELINE_BACKEND_DEEPGEMM = "deepgemm"
 BASELINE_BACKEND_TORCH = "torch"
+
+
+def _apply_model_shape(model_shape: str, num_ranks: int) -> None:
+    global NUM_RANKS, NUM_EXPERTS, NUM_TOPK, HIDDEN, INTERMEDIATE_HIDDEN
+    global NUM_LOCAL_EXPERTS
+
+    if model_shape not in MODEL_SHAPES:
+        raise ValueError(f"unsupported INT8 model shape: {model_shape}")
+    num_experts, num_topk, hidden, intermediate_hidden = MODEL_SHAPES[model_shape]
+    if num_ranks not in (8, 16, 32):
+        raise ValueError(f"INT8 baseline supports EP8/EP16/EP32, got EP{num_ranks}")
+    if num_experts % num_ranks != 0:
+        raise ValueError(
+            f"{model_shape} experts={num_experts} is not divisible by EP{num_ranks}"
+        )
+    NUM_RANKS = int(num_ranks)
+    NUM_EXPERTS = int(num_experts)
+    NUM_TOPK = int(num_topk)
+    HIDDEN = int(hidden)
+    INTERMEDIATE_HIDDEN = int(intermediate_hidden)
+    NUM_LOCAL_EXPERTS = NUM_EXPERTS // NUM_RANKS
 
 
 def _dispatch_int8(
@@ -403,8 +429,11 @@ def _global_correctness(fused_y, baseline_y, fused_stats, baseline_stats, group)
 
 def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank, world_size, group = init_dist(local_rank, num_local_ranks)
-    if world_size != NUM_RANKS:
-        raise ValueError(f"YGZP INT8 baseline test requires EP8, got world_size={world_size}")
+    if world_size != args.num_processes:
+        raise ValueError(
+            f"INT8 baseline expected world_size={args.num_processes}, got {world_size}"
+        )
+    _apply_model_shape(args.model_shape, world_size)
     torch.manual_seed(args.seed + rank)
 
     exact_tokens = None
@@ -583,7 +612,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     print_once(
         rank,
-        "YGZP INT8 EP8 eager-normal: fused vs true INT8 normal-contiguous baseline",
+        "INT8 eager-normal: fused vs true INT8 normal-contiguous baseline",
     )
     print_once(
         rank,
@@ -591,6 +620,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f"capacity={args.num_max_tokens_per_rank}, route={args.route_pattern}",
     )
     print_once(rank, f" > shape={NUM_EXPERTS}/{NUM_TOPK}/{HIDDEN}/{INTERMEDIATE_HIDDEN}")
+    print_once(rank, f" > model_shape={args.model_shape}, ep={NUM_RANKS}")
     print_once(rank, f" > baseline backend={baseline_backend}")
     print_once(rank, f" > baseline weight layout={baseline_weight_layout}, atol={baseline_atol}")
 
@@ -645,7 +675,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         fused_median, fused_min, baseline_median, baseline_min = avg_timings
         result = {
             "correct": True,
-            "execution": "ygzp_ep8_normal_int8_eager",
+            "execution": f"{args.model_shape}_ep{NUM_RANKS}_normal_int8_eager",
             "baseline_execution": (
                 "deepep_torch_int8_reference_eager"
                 if baseline_backend == BASELINE_BACKEND_TORCH
@@ -653,6 +683,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             ),
             "baseline_backend": baseline_backend,
             "quant_mode": "int8",
+            "model_shape": args.model_shape,
             "num_ranks": NUM_RANKS,
             "num_experts": NUM_EXPERTS,
             "num_topk": NUM_TOPK,
@@ -713,7 +744,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="YGZP EP8 INT8 MegaMoE fused versus true INT8 baseline"
+        description="INT8 MegaMoE fused versus true INT8 baseline"
     )
     parser.add_argument("--num-processes", type=int, default=NUM_RANKS)
     parser.add_argument("--local-rank-idx", type=int, default=None)
@@ -721,6 +752,11 @@ def parse_args():
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=512)
     parser.add_argument("--num-tokens", type=int, default=512)
     parser.add_argument("--num-tokens-per-rank-list", type=str, default="")
+    parser.add_argument(
+        "--model-shape",
+        choices=tuple(MODEL_SHAPES),
+        default=MODEL_SHAPE_DEFAULT,
+    )
     parser.add_argument(
         "--route-pattern",
         choices=(ROUTE_PATTERN_RANDOM, ROUTE_PATTERN_SINGLE_LOCAL_RANK),
@@ -747,8 +783,13 @@ def parse_args():
         default="hygon_tmp/megamoe_int8_baseline/default.json",
     )
     args = parser.parse_args()
-    if args.num_processes != NUM_RANKS:
-        parser.error(f"YGZP INT8 baseline test requires --num-processes {NUM_RANKS}")
+    if args.num_processes not in (8, 16, 32):
+        parser.error("INT8 baseline requires --num-processes 8, 16, or 32")
+    if MODEL_SHAPES[args.model_shape][0] % args.num_processes != 0:
+        parser.error(
+            f"{args.model_shape} is not divisible by --num-processes "
+            f"{args.num_processes}"
+        )
     if args.correctness_iters < 1:
         parser.error("--correctness-iters must be at least 1")
     if args.atol is not None and args.atol < 0:

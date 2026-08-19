@@ -948,7 +948,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 l2_bf16,
             )
         )
-        layout_desc = "YGZP signed-INT8 normal ASM plain pack5"
+        layout_desc = "signed-INT8 normal ASM plain pack5"
     elif weight_layout == "normal":
         fused_l1_weights = {
             "normal": (megamoe.flatten_pack5_weight_asm_normal(l1_fp8), l1_scale),
@@ -1915,7 +1915,7 @@ def parse_args():
         "--quant-mode",
         choices=("fp8", "int8"),
         default="fp8",
-        help="fused MegaMoE activation/weight quantization; INT8 is YGZP EP8 normal eager only",
+        help="fused MegaMoE activation/weight quantization; INT8 uses normal eager only",
     )
     parser.add_argument("--input-scale", type=float, default=0.05)
     parser.add_argument("--weight-scale", type=float, default=0.05)

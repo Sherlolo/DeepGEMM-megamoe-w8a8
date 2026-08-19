@@ -34,6 +34,7 @@ from .dcu_megamoe_opt.v3_config import (
     V3_QUANT_INT8,
     normalize_v3_backend,
     normalize_v3_quant,
+    staged_pack5_legacy_model_shape_supported,
     staged_pack5_shape_supported,
     staged_v3_capability_supported,
 )
@@ -837,6 +838,7 @@ def prepare_opt_3stage(sym_buffer, *, verbose_build: bool = False) -> None:
         intermediate_hidden=sym_buffer.intermediate_hidden,
         init_tail_reduce=(
             not int8_compute
+            and sym_buffer.num_topk == 6
             and k3_tail_reduce_enabled(default=int(sym_buffer.group.size()) <= 8)
         ),
         verbose_build=verbose_build,
@@ -908,15 +910,15 @@ def fp8_mega_moe_opt_3stage(
     int8_compute = quant_mode == V3_QUANT_INT8
     if int8_compute:
         if v3_backend != V3_BACKEND_NORMAL:
-            raise NotImplementedError("YGZP INT8 supports the normal backend only")
+            raise NotImplementedError("INT8 supports the normal backend only")
         if use_unified_weight_layout or use_pro_ll_masked_k1:
             raise NotImplementedError(
-                "YGZP INT8 supports normal non-unified weights only"
+                "INT8 supports normal non-unified weights only"
             )
         if getattr(sym_buffer, "quant_mode", quant_mode) != V3_QUANT_INT8:
-            raise ValueError("YGZP INT8 requires an INT8 SymmBuffer")
+            raise ValueError("INT8 requires an INT8 SymmBuffer")
         if l1_weight.dtype != torch.int8 or l2_weight.dtype != torch.int8:
-            raise TypeError("YGZP INT8 requires signed INT8 L1/L2 weights")
+            raise TypeError("INT8 requires signed INT8 L1/L2 weights")
     route_capacity_num_tokens = (
         num_tokens if capacity_num_tokens is None else int(capacity_num_tokens)
     )
@@ -944,7 +946,11 @@ def fp8_mega_moe_opt_3stage(
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
     use_tail_reduce = (
         not int8_compute
+        and num_topk == 6
         and _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
+    )
+    request_active_tiles_host_hint = (
+        v3_backend == V3_BACKEND_NORMAL and not use_tail_reduce
     )
     use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(v3_backend, num_tokens)
     state = _state(
@@ -985,11 +991,21 @@ def fp8_mega_moe_opt_3stage(
             verbose_build=verbose_build,
         )
     local_experts = int(num_experts) // int(num_ranks)
+    dynamic_fp8_shape = (
+        not int8_compute
+        and not staged_pack5_legacy_model_shape_supported(
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=intermediate_hidden,
+        )
+    )
     force_safe_compact = (
         num_tokens == 0
         or route_capacity_num_tokens > num_tokens
         or num_ranks > 8
         or local_experts > 32
+        or dynamic_fp8_shape
     )
     k1_launcher = k1_symm_fused_l1_v3
     k1_kwargs = dict(
@@ -1007,7 +1023,7 @@ def fp8_mega_moe_opt_3stage(
         use_unified_weight_layout=use_unified_weight_layout,
         quant_mode=quant_mode,
         verbose_build=verbose_build,
-        return_active_tiles_host_hint=int8_compute,
+        return_active_tiles_host_hint=request_active_tiles_host_hint,
     )
     k1_kwargs["backend"] = v3_backend
     if v3_backend == V3_BACKEND_LL:
@@ -1065,7 +1081,7 @@ def fp8_mega_moe_opt_3stage(
                 verbose_build=verbose_build,
             )
         )
-    elif int8_compute:
+    elif request_active_tiles_host_hint:
         (
             l1_out,
             route_weights,
@@ -1076,6 +1092,7 @@ def fp8_mega_moe_opt_3stage(
         ) = k1_result
     else:
         l1_out, route_weights, m_indices, output_index, row_combine_ptrs = k1_result
+        active_tiles_host_hint = None
     rows = int(l1_out.size(0))
     act_fp8 = state.scratch.act_fp8[:rows]
     act_scale = state.scratch.act_scale[:rows]
@@ -1163,7 +1180,7 @@ def fp8_mega_moe_opt_3stage(
             verbose_build=verbose_build,
         )
         k3_kwargs["backend"] = v3_backend
-        if int8_compute:
+        if request_active_tiles_host_hint:
             k3_kwargs["active_tiles_host_hint"] = active_tiles_host_hint
         if v3_backend == V3_BACKEND_LL:
             k3_kwargs["ll_block_m"] = ll_block_m
@@ -1253,7 +1270,10 @@ def _run_opt_3stage_graph(
 
     alignment = 256
     verbose_build = os.getenv("MEGAMOE_DCU_OPT_VERBOSE_BUILD", "0") == "1"
-    use_tail_reduce = _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
+    use_tail_reduce = (
+        num_topk == 6
+        and _tail_reduce_enabled_for_backend(v3_backend, num_ranks)
+    )
     use_ll_split_tail = _ll_k3_split_tail_enabled_for_tokens(
         v3_backend, graph_max_tokens
     )

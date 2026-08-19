@@ -6,6 +6,7 @@ import torch
 
 from ..v3_config import (
     STAGED_PACK5_SHAPE_CONTRACT,
+    STAGED_V3_CAPABILITY_CONTRACT,
     SUPPORTED_STAGED_EP_RANKS,
     V3_BACKEND_NORMAL,
     V3_QUANT_FP8,
@@ -45,7 +46,7 @@ K1_SUPPORTED_RANKS = SUPPORTED_STAGED_EP_RANKS
 K1_SUPPORTED_ALIGNMENT = 256
 K1_SHAPE_CONTRACT = (
     f"{STAGED_PACK5_SHAPE_CONTRACT}, K1 L1 output features must equal "
-    "2 * intermediate, alignment=256, and "
+    f"2 * intermediate. {STAGED_V3_CAPABILITY_CONTRACT}, alignment=256, and "
     "0<=num_tokens_per_rank<=num_max_tokens_per_rank"
 )
 
@@ -96,7 +97,7 @@ def ensure_fused_l1_asm_pack5_code_object(
     int8_compute: bool = False,
 ) -> Path:
     if int8_compute and use_unified_weight_layout:
-        raise ValueError("YGZP INT8 K1 supports normal non-unified PACK5 only")
+        raise ValueError("INT8 K1 supports normal non-unified PACK5 only")
     if int8_compute:
         co = FUSED_L1_INT8_ASM_PACK5_CO
     else:
@@ -229,8 +230,6 @@ def k1_symm_fused_l1_v3_asm_pack5(
 ):
     l1_weight_pack5, l1_scale = l1_weights
     quant_mode = normalize_v3_quant(quant_mode)
-    if return_active_tiles_host_hint and quant_mode != V3_QUANT_INT8:
-        raise ValueError("active_tiles host hint is available for INT8 K1 only")
     _check_fused_l1_shape(
         num_ranks=num_ranks,
         num_experts=num_experts,
@@ -434,11 +433,9 @@ def k1_symm_fused_l1_v3(
     backend = normalize_v3_backend(backend)
     quant_mode = normalize_v3_quant(quant_mode)
     if quant_mode == V3_QUANT_INT8 and backend != V3_BACKEND_NORMAL:
-        raise ValueError("YGZP INT8 K1 supports normal backend only")
+        raise ValueError("INT8 K1 supports normal backend only")
     if return_active_tiles_host_hint and backend != V3_BACKEND_NORMAL:
         raise ValueError("active_tiles host hint is available on normal K1 only")
-    if return_active_tiles_host_hint and quant_mode != V3_QUANT_INT8:
-        raise ValueError("active_tiles host hint is available for INT8 K1 only")
     l1_weight_pack5, l1_scale = l1_weights
     _check_fused_l1_shape(
         num_ranks=num_ranks,

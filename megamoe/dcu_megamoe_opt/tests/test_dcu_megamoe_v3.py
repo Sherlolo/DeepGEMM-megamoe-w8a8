@@ -33,9 +33,19 @@ K1_INT8_ASM_PATH = (
     / "DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
     "MEGAMOE_DISPATCH_PULL_L1_PACK5.s"
 )
+K1_FP8_ASM_PATH = (
+    K1_FUSED_DIR
+    / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+    "MEGAMOE_DISPATCH_PULL_L1_PACK5.s"
+)
 K3_INT8_ASM_PATH = (
     K3_FUSED_DIR
     / "DeepGemm_W8A8_I8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
+    "K3COMBINE_PACK5.s"
+)
+K3_FP8_ASM_PATH = (
+    K3_FUSED_DIR
+    / "DeepGemm_W8A8_F8_MARLIN_PERCHANNEL_ASM_TN_MT256X256X128_BF16_"
     "K3COMBINE_PACK5.s"
 )
 
@@ -242,7 +252,7 @@ def test_v3_backend_auto_policy(monkeypatch):
         config.select_v3_backend(8, "bogus")
 
 
-def test_v3_model_shape_registry_covers_flash_and_pro_ep_sizes():
+def test_v3_model_shape_registry_supports_dynamic_fp8_shape():
     config = load_module("dcu_megamoe_v3_config_shapes", V3_CONFIG_PATH)
 
     for shape, local_experts_by_rank in (
@@ -269,17 +279,41 @@ def test_v3_model_shape_registry_covers_flash_and_pro_ep_sizes():
                 == expected_local_experts
             )
 
-    assert not config.staged_pack5_shape_supported(
+    assert config.staged_pack5_shape_supported(
         num_ranks=16,
-        num_experts=384,
-        num_topk=6,
-        hidden=4096,
-        intermediate_hidden=3072,
+        num_experts=320,
+        num_topk=4,
+        hidden=1280,
+        intermediate_hidden=640,
     )
-    assert "DeepSeek-V4-Pro" in config.STAGED_PACK5_SHAPE_CONTRACT
+    for hidden, intermediate in ((1152, 640), (1280, 641), (1280, 4224)):
+        assert not config.staged_pack5_shape_supported(
+            num_ranks=16,
+            num_experts=384,
+            num_topk=6,
+            hidden=hidden,
+            intermediate_hidden=intermediate,
+        )
+    for num_ranks, num_experts, num_topk in (
+        (8, 321, 4),
+        (8, 520, 4),
+        (8, 320, 0),
+        (8, 320, 321),
+    ):
+        assert not config.staged_pack5_shape_supported(
+            num_ranks=num_ranks,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden=1280,
+            intermediate_hidden=640,
+        )
+    assert "normal FP8" in config.STAGED_PACK5_SHAPE_CONTRACT
+    assert "at most 64 local experts" in config.STAGED_PACK5_SHAPE_CONTRACT
+    assert "topk in [1, experts]" in config.STAGED_PACK5_SHAPE_CONTRACT
+    assert "hidden divisible by 256" in config.STAGED_PACK5_SHAPE_CONTRACT
 
 
-def test_v3_exact_capability_gate_preserves_fp8_and_scopes_ygzp_int8():
+def test_v3_capability_gate_supports_dynamic_normal_fp8_and_scopes_ygzp_int8():
     config = load_module("dcu_megamoe_v3_config_capabilities", V3_CONFIG_PATH)
 
     for shape in (
@@ -299,28 +333,40 @@ def test_v3_exact_capability_gate_preserves_fp8_and_scopes_ygzp_int8():
                     intermediate_hidden=intermediate_hidden,
                 )
 
+    dynamic_fp8 = {
+        "num_experts": 320,
+        "num_topk": 4,
+        "hidden": 1280,
+        "intermediate_hidden": 640,
+    }
+    for num_ranks in (8, 16, 32):
+        assert config.staged_v3_capability_supported(
+            quant="fp8", backend="normal", num_ranks=num_ranks, **dynamic_fp8
+        )
+        assert not config.staged_v3_capability_supported(
+            quant="fp8", backend="ll", num_ranks=num_ranks, **dynamic_fp8
+        )
+
     ygzp = {
         "num_experts": 288,
         "num_topk": 8,
         "hidden": 4096,
         "intermediate_hidden": 2048,
     }
-    assert config.staged_v3_capability_supported(
-        quant="int8", backend="normal", num_ranks=8, **ygzp
-    )
-    assert (
-        config.staged_v3_capability_local_experts(
-            quant="int8", backend="normal", num_ranks=8, **ygzp
+    for num_ranks, local_experts in ((8, 36), (16, 18), (32, 9)):
+        assert config.staged_v3_capability_supported(
+            quant="int8", backend="normal", num_ranks=num_ranks, **ygzp
         )
-        == 36
-    )
+        assert (
+            config.staged_v3_capability_local_experts(
+                quant="int8", backend="normal", num_ranks=num_ranks, **ygzp
+            )
+            == local_experts
+        )
 
     rejected = (
-        ("int8", "normal", 16),
-        ("int8", "normal", 32),
         ("int8", "normal", 0),
         ("int8", "ll", 8),
-        ("fp8", "normal", 8),
         ("fp8", "ll", 8),
         ("bogus", "normal", 8),
         ("int8", "bogus", 8),
@@ -332,6 +378,10 @@ def test_v3_exact_capability_gate_preserves_fp8_and_scopes_ygzp_int8():
             num_ranks=num_ranks,
             **ygzp,
         )
+
+    assert config.staged_v3_capability_supported(
+        quant="fp8", backend="normal", num_ranks=8, **ygzp
+    )
 
     for field, unsupported_value in (
         ("num_experts", 287),
@@ -350,19 +400,29 @@ def test_v3_exact_capability_gate_preserves_fp8_and_scopes_ygzp_int8():
         "hidden": 4096,
         "intermediate_hidden": 2048,
     }
-    assert not config.staged_v3_capability_supported(
+    assert config.staged_v3_capability_supported(
         quant="int8", backend="normal", num_ranks=8, **flash
+    )
+    pro = {
+        "num_experts": 384,
+        "num_topk": 6,
+        "hidden": 7168,
+        "intermediate_hidden": 3072,
+    }
+    assert not config.staged_v3_capability_supported(
+        quant="int8", backend="normal", num_ranks=8, **pro
     )
     assert not config.staged_v3_capability_supported(
         quant="fp8", backend="auto", num_ranks=8, **flash
     )
 
-    assert not config.staged_pack5_shape_supported(num_ranks=8, **ygzp)
-    assert not config.staged_pack5_local_experts_supported(36)
-    assert 36 not in config.STAGED_PACK5_LOCAL_EXPERTS
-    with pytest.raises(ValueError, match="INT8 YGZP normal on EP8"):
+    assert config.staged_pack5_shape_supported(num_ranks=8, **ygzp)
+    assert config.staged_pack5_local_experts_supported(36)
+    assert 36 in config.STAGED_PACK5_LOCAL_EXPERTS
+    assert not config.staged_pack5_local_experts_supported(65)
+    with pytest.raises(ValueError, match="INT8 DeepSeek-V4-Flash/YGZP"):
         config.staged_v3_capability_local_experts(
-            quant="int8", backend="normal", num_ranks=16, **ygzp
+            quant="int8", backend="normal", num_ranks=4, **ygzp
         )
 
 
@@ -737,7 +797,7 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     assert "v_mov_b32 v253, 64                                 // route_scratch total active compact tiles" not in k1_asm_sources
     assert "s_cmp_ge_u32 s[sgprScaleFlag], 32" not in k1_asm_sources
     assert k1_asm_sources.count("packed compact metadata") == 2
-    assert k1_asm_sources.count("route_scratch active_tiles i32 offset") == 2
+    assert k1_asm_sources.count("route_scratch active_tiles i32 offset") == 1
     assert "m_indices[compact tile * 256]" not in k1_asm_sources
     assert k1_asm_sources.count("tile_experts offset") == 2
     assert (
@@ -759,17 +819,18 @@ def test_v3_runtime_sources_have_clear_backend_boundaries():
     ) == 4
     assert k1_asm_sources.count("s_mul_i32 s71, s91, s[sgprSizeL]") == 2
     assert k1_asm_sources.count("s_lshl_b32 s60, s[sgprSizeL], 3") == 2
-    assert k1_asm_sources.count("label_SymmStageProIndex") == 4
+    assert "label_SymmStageProIndex" not in k1_asm_sources
     assert "v_mul_lo_u32 v251, 9363, v251" not in k1_asm_sources
     assert "v_mul_lo_u32 v252, 224, v251" not in k1_asm_sources
-    assert k1_asm_sources.count("s_mov_b32 s63, 9363") == 2
-    assert k1_asm_sources.count("v_mul_lo_u32 v251, s63, v251") == 2
-    assert k1_asm_sources.count("s_mov_b32 s63, 224") == 2
-    assert k1_asm_sources.count("v_mul_lo_u32 v252, s63, v251") == 2
-    assert k1_asm_sources.count("label_SymmStageStoreDynamicStride") == 4
+    assert "s_mov_b32 s63, 9363" not in k1_asm_sources
+    assert k1_asm_sources.count("s_lshr_b32 s63, s[sgprSizeL], 5") == 2
+    assert k1_asm_sources.count("v_rcp_iflag_f32 v251, v251") == 2
+    assert k1_asm_sources.count("correct an overestimate") == 2
+    assert k1_asm_sources.count("correct an underestimate") == 2
+    assert "label_SymmStageStoreDynamicStride" not in k1_asm_sources
     assert k1_asm_sources.count("global staged row * hidden") == 2
     assert k1_asm_sources.count("v_mul_lo_u32 v251, s[sgprSizeL], v251") == 2
-    assert k1_asm_sources.count("v_lshlrev_b32 v251, 12, v251") == 2
+    assert "v_lshlrev_b32 v251, 12, v251" not in k1_asm_sources
     assert "dcu_megamoe_v3_launch_k1_ll_symm_stage_pack5" in k1_ext
     assert "V3_K1_LowLatencyMaskedGroupGemmKernel" in k1_header
     assert "tail_chunk_expected" not in k1_py
@@ -1574,9 +1635,9 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     opt_source = OPT_PATH.read_text(encoding="utf-8")
 
     assert "dcu_supported_staged_pack5_shape" in api_source
-    assert "DeepSeek-V4-Flash" in api_source
-    assert "DeepSeek-V4-Pro" in api_source
-    assert "hidden=7168" in api_source
+    assert "hidden/intermediate" in api_source
+    assert "hidden divisible by 256" in api_source
+    assert "intermediate<=4096" in api_source
     assert "return legacy_route_scratch_bytes();" not in api_source
     assert "dcu_route_scratch_bytes(" not in api_source
     assert "MEGAMOE_DCU_NORMAL" not in api_source
@@ -1650,7 +1711,7 @@ def test_v3_staged_route_scratch_size_uses_ll_normal_layout():
     assert "use_fp8_dispatch ? torch::kFloat8_e4m3fn : torch::kInt8" not in api_source
     assert "empty_quant" in api_source
     assert "quant_options" in api_source
-    assert "ygzp_int8_normal_ep8_shape" in api_source
+    assert "int8_normal_shape" in api_source
     assert "dcu_supported_staged_int8_normal_shape" in api_source
 
 
@@ -1854,7 +1915,7 @@ def test_ygzp_int8_public_route_is_exact_eager_normal_compact_no_tail():
     assert "TORCH_CHECK(!int8_compute || use_compact_prebuild" in k1_ext
     assert "hipLaunchKernelGGL(store_gpu_prob_kernel" in k1_ext
     assert "K1 GpuProb must fit in the 256-byte argument slot" in k1_ext
-    assert "local_experts == 36" in k1_ext
+    assert "dcu_supported_staged_int8_local_experts" in k1_ext
 
     assert "K3_COMBINE_INT8_PACK5_ASM_CO" in k3_py
     assert 'backend != "normal"' in k3_py
@@ -1866,8 +1927,8 @@ def test_ygzp_int8_public_route_is_exact_eager_normal_compact_no_tail():
     assert "hipLaunchKernelGGL(store_gpu_prob_kernel" in k3_ext
     assert "if (int8_compute)" in k3_ext
     assert "K3 integrated tail reduction is FP8-only" in k3_ext
-    assert "local_experts ==" in k3_ext
-    assert "kDcuMegaMoeYgzpExperts / 8" in k3_ext
+    assert "dcu_supported_staged_int8_local_experts" in k3_ext
+    assert "kDcuMegaMoeYgzpExperts / 8" not in k3_ext
 
 
 def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
@@ -1894,14 +1955,16 @@ def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
     k1_py = (K1_FUSED_DIR / "k1_fused.py").read_text(encoding="utf-8")
     k1_ext = (K1_FUSED_DIR / "k1_fused_ext.cu").read_text(encoding="utf-8")
     k1_asm = K1_INT8_ASM_PATH.read_text(encoding="utf-8")
+    k1_fp8_asm = K1_FP8_ASM_PATH.read_text(encoding="utf-8")
     k3_py = (K3_FUSED_DIR / "k3_fused.py").read_text(encoding="utf-8")
     k3_ext = (K3_FUSED_DIR / "k3_fused_ext.cu").read_text(encoding="utf-8")
+    k3_fp8_asm = K3_FP8_ASM_PATH.read_text(encoding="utf-8")
     k2_py = (K2_FUSED_DIR / "k2_fused.py").read_text(encoding="utf-8")
     k2_ext = (K2_FUSED_DIR / "k2_fused_ext.cu").read_text(encoding="utf-8")
 
     assert "return_active_tiles_host_hint: bool = False" in k1_py
-    assert "active_tiles host hint is available for INT8 K1 only" in k1_py
-    assert "active_tiles host hint is available for INT8 K1 only" in k1_ext
+    assert "active_tiles host hint is available for INT8 K1 only" not in k1_py
+    assert "active_tiles host hint is available for INT8 K1 only" not in k1_ext
     assert 'pybind11::arg("return_active_tiles_host_hint") = false' in k1_ext
     assert "if (return_active_tiles_host_hint)" in k1_ext
     assert "active_tiles_host_hint = -1" in k1_ext
@@ -1915,12 +1978,22 @@ def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
     assert "offsetof(GpuProb, active_tiles) == 0xf8" in k1_ext
     assert "prob.active_tiles = use_compact_prebuild" in k1_ext
     assert ".L_k1_active_tile_gate_done" in k1_asm
-    assert "s_load_dwordx2 s[90:91], s[sgprExternalArgAddress:sgprExternalArgAddress+1], 0xf8" in k1_asm
+    assert "s_load_dwordx2 s[90:91], s[sgprKernArgAddress:sgprKernArgAddress+1], 0x44" in k1_asm
+    assert "s_load_dword s88, s[90:91], 0x0" in k1_asm
     assert "s_lshr_b32 s89, s[sgprWorkGroup0], 4" in k1_asm
     assert "label_SymmRoutePrebuiltActiveTile" not in k1_asm
+    assert "offsetof(KernelArgs, n_workgroups_per_tile) == 0x4c" in k1_ext
+    assert "args.n_workgroups_per_tile = static_cast<uint32_t>(wg_m)" in k1_ext
+    assert ".L_k1_fp8_entry_active_tile_gate_done" in k1_fp8_asm
+    assert "s_load_dwordx2 s[90:91]" in k1_fp8_asm
+    assert "0x44" in k1_fp8_asm
+    assert "s_load_dword s87" in k1_fp8_asm
+    assert "0x4c" in k1_fp8_asm
+    assert "s_mul_i32 s88, s88, s87" in k1_fp8_asm
+    assert "label_SymmRoutePrebuiltActiveTile" not in k1_fp8_asm
     assert "std::min<int64_t>(" in k1_ext
     assert "capacity_rows + kK1RowPointerPadding" in k1_ext
-    assert "return_active_tiles_host_hint=int8_compute" in opt_3stage
+    assert "return_active_tiles_host_hint=request_active_tiles_host_hint" in opt_3stage
     assert "active_tiles_host_hint," in opt_3stage
     assert (
         'k3_kwargs["active_tiles_host_hint"] = active_tiles_host_hint'
@@ -1944,10 +2017,18 @@ def test_ygzp_int8_eager_uses_device_active_tile_gates_without_d2h():
     assert "return_active_tiles_host_hint" not in k1_graph
 
     hint_branch = k3_ext.index("if (active_tiles_host_hint >= 0)")
-    assert "active_tiles_host_hint is available for INT8 K3 only" in k3_ext
+    assert "active_tiles_host_hint is available for INT8 K3 only" not in k3_ext
     assert "hipMemcpyDeviceToHost" not in k3_ext[hint_branch:]
     assert "hipStreamSynchronize(stream)" not in k3_ext[hint_branch:]
     assert "prob.active_tiles = active_tiles->data_ptr<int32_t>()" in k3_ext
+    assert "offsetof(KernelArgs, active_tiles) == 0x2c" in k3_ext
+    assert "offsetof(KernelArgs, n_workgroups_per_tile) == 0x34" in k3_ext
+    assert "args.n_workgroups_per_tile = static_cast<uint32_t>(wg_m)" in k3_ext
+    assert ".L_k3_fp8_entry_active_tile_gate_done" in k3_fp8_asm
+    assert "s_mul_i32 s88, s88, s87" in k3_fp8_asm
+    assert ".L_k3_active_tile_gate_done" not in k3_fp8_asm
+    assert "v_mov_b32 v255, 1" in k3_fp8_asm
+    assert k3_fp8_asm.count("v_cmp_eq_u32 vcc, 0, v255") == 6
     assert "active_tiles=k2_active_tiles" in opt_3stage
 
     k2_call = opt_3stage.split("k2_quant(", 1)[1].split(

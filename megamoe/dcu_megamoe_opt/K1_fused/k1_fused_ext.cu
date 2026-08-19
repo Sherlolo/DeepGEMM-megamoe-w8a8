@@ -119,12 +119,11 @@ static constexpr double kK1AutoCompactMinLocalTileSaving = 8.0;
 static constexpr int64_t kK1AutoCompactHighTilesPerExpert = 7;
 static constexpr double kK1CompactTightMarginMinSaving = 0.45;
 static constexpr const char* kK1ShapeContract =
-    "K1_fused dispatch-pull L1 pack5 supports DeepSeek-V4-Flash "
-    "EP8/EP16/EP32 (experts=256, topk=6, hidden=4096, intermediate=2048) "
-    "and DeepSeek-V4-Pro EP8/EP16/EP32 (experts=384, topk=6, hidden=7168, "
-    "intermediate=3072), or YGZP INT8 normal EP8 (experts=288, topk=8, "
-    "hidden=4096, intermediate=2048), L1 output features=2*intermediate, route_tile_m=256, "
-    "alignment=256, and 0<=num_tokens_per_rank<=num_max_tokens_per_rank";
+    "K1_fused FP8 dispatch-pull L1 pack5 supports positive experts divisible "
+    "by EP8/EP16/EP32 with at most 64 local experts and topk in [1, experts], "
+    "hidden divisible by 256, "
+    "intermediate divisible by 128 and <=4096, L1 output features=2*intermediate, "
+    "route_tile_m=256, alignment=256, plus the registered INT8 shapes";
 
 bool is_supported_staged_rank_count(const int64_t num_ranks) {
     return deep_gemm::mega::dcu_supported_staged_ep_rank_count(
@@ -347,10 +346,13 @@ struct __attribute__((packed)) KernelArgs {
     int32_t* staged_flags;
     void* symm_base;
     int32_t* active_tiles;
+    uint32_t n_workgroups_per_tile;
 };
 
 static_assert(offsetof(KernelArgs, active_tiles) == 0x44,
-              "K1 INT8 asm expects active_tiles at kernarg+0x44");
+              "K1 asm expects active_tiles at kernarg+0x44");
+static_assert(offsetof(KernelArgs, n_workgroups_per_tile) == 0x4c,
+              "K1 asm expects n_workgroups_per_tile at kernarg+0x4c");
 
 struct LoadedAsmKernel {
     std::mutex mutex;
@@ -821,8 +823,15 @@ int64_t launch_l1_deepgemm_fused_asm(
                 kK1ShapeContract);
     TORCH_CHECK(total_rows > 0 && total_rows % kK1RouteTileM == 0,
                 "fused L1 asm expects total_rows padded to a 256-row tile");
-    TORCH_CHECK(int8_compute ? local_experts == 36
-                             : is_supported_staged_local_experts(local_experts),
+    TORCH_CHECK(static_cast<uint64_t>(total_rows) * n <= UINT32_MAX &&
+                    static_cast<uint64_t>(total_rows) * hidden <= UINT32_MAX &&
+                    static_cast<uint64_t>(n) * hidden <= UINT32_MAX,
+                "fused L1 asm strides must fit in uint32");
+    TORCH_CHECK(int8_compute
+                    ? deep_gemm::mega::dcu_supported_staged_int8_local_experts(
+                          static_cast<int>(local_experts))
+                    : deep_gemm::mega::dcu_supported_staged_normal_local_experts(
+                          local_experts),
                 kK1ShapeContract);
     TORCH_CHECK(sym_buffer.is_cuda() && sym_buffer.scalar_type() == torch::kInt8 &&
                     sym_buffer.is_contiguous(),
@@ -1085,6 +1094,7 @@ int64_t launch_l1_deepgemm_fused_asm(
     args.staged_flags = staged_flags;
     args.symm_base = reinterpret_cast<void*>(symm_base_addr);
     args.active_tiles = prob.active_tiles;
+    args.n_workgroups_per_tile = static_cast<uint32_t>(wg_m);
 
     const int local_work_size = 768;
     const size_t global_work_items =
@@ -1397,8 +1407,6 @@ k1_symm_fused_l1_asm_impl(
     TORCH_CHECK(route_scratch.scalar_type() == torch::kInt8,
                 "route_scratch must be int8");
     const bool int8_compute = l1_weight.scalar_type() == torch::kInt8;
-    TORCH_CHECK(!return_active_tiles_host_hint || int8_compute,
-                "active_tiles host hint is available for INT8 K1 only");
     TORCH_CHECK(int8_compute || l1_weight.scalar_type() == torch::kFloat8_e4m3fn,
                 "l1_weight must be FP8 E4M3 or INT8");
     TORCH_CHECK(l1_scale.scalar_type() == torch::kFloat32,
@@ -1437,8 +1445,11 @@ k1_symm_fused_l1_asm_impl(
                   static_cast<int>(num_topk), static_cast<int>(hidden),
                   static_cast<int>(l1_rows)),
                 kK1ShapeContract);
-    TORCH_CHECK(int8_compute ? local_experts == 36
-                             : is_supported_staged_local_experts(local_experts),
+    TORCH_CHECK(int8_compute
+                    ? deep_gemm::mega::dcu_supported_staged_int8_local_experts(
+                          static_cast<int>(local_experts))
+                    : deep_gemm::mega::dcu_supported_staged_normal_local_experts(
+                          static_cast<int>(local_experts)),
                 kK1ShapeContract);
     TORCH_CHECK(l1_weight.size(0) == local_experts &&
                     l1_weight.size(1) == l1_rows / 16 &&
@@ -1500,7 +1511,7 @@ k1_symm_fused_l1_asm_impl(
             fixed_capacity_tiles_per_expert);
     }
     TORCH_CHECK(!int8_compute || use_compact_prebuild,
-                "YGZP INT8 K1 requires compact prebuilt routing");
+                "INT8 K1 requires compact prebuilt routing");
     const int64_t fixed_capacity_tiles =
         local_experts * fixed_capacity_tiles_per_expert;
     const int64_t capacity_tiles = use_compact_prebuild
