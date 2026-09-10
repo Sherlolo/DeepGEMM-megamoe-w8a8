@@ -178,6 +178,17 @@ def get_ext_modules():
         ]
         modules.extend([
             CUDAExtension(
+                name='megamoe.dcu_megamoe_opt.w4a8_ext',
+                sources=[
+                    os.path.join(opt_root, 'csrc', 'kernels', 'w4a8_gemm.cu'),
+                    os.path.join(opt_root, 'csrc', 'kernels', 'w4a8_route.cu'),
+                ],
+                include_dirs=build_include_dirs,
+                libraries=build_libraries,
+                library_dirs=build_library_dirs,
+                extra_compile_args={'cxx': cxx_flags, 'nvcc': hipcc_flags + ['-DNDEBUG', '-mllvm', '-enable-num-vgprs-768=true']},
+            ),
+            CUDAExtension(
                 name='megamoe.dcu_megamoe_opt.K1_fused.k1_fused_ext',
                 sources=[
                     os.path.join(opt_root, 'K1_fused', 'k1_fused_ext.cu'),
@@ -265,6 +276,8 @@ def get_package_data():
                 'csrc/*.cpp',
                 'csrc/apis/*.hpp',
                 'csrc/kernels/*.cu',
+                'csrc/kernels/*.h',
+                'csrc/kernels/*ORIGIN.md',
                 'tests/*.py',
                 'scripts/*.sh',
             ],

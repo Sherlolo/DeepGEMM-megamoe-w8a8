@@ -523,7 +523,8 @@ class SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
         self.quant_mode = normalize_v3_quant(quant_mode)
-        int8_compute = self.quant_mode == V3_QUANT_INT8
+        w4a8_compute = self.quant_mode == "w4a8"
+        int8_compute = self.quant_mode in (V3_QUANT_INT8, "w4a8")
         self.use_fp8_dispatch = bool(use_fp8_dispatch)
         self.cuda_graph_max_tokens_per_rank = int(
             cuda_graph_max_tokens_per_rank
@@ -551,7 +552,16 @@ class SymmBuffer:
                 "ll_scratch_capacity_tokens_per_rank must be in "
                 f"1..{self.num_max_tokens_per_rank}"
             )
-        if int8_compute:
+        if w4a8_compute:
+            if num_max_tokens_per_rank % 4:
+                raise ValueError("W4A8 symmetric capacity must be divisible by 4; use get_symm_buffer_for_mega_moe for automatic padding")
+            _check_staged_pack5_shape(
+                num_ranks=group.size(), num_experts=num_experts, num_topk=num_topk,
+                hidden=hidden, intermediate_hidden=intermediate_hidden,
+            )
+            if group.size() != 8 or hidden % 512 or intermediate_hidden % 256:
+                raise ValueError("W4A8 HIPC requires EP8, hidden % 512 == 0, intermediate % 256 == 0")
+        elif int8_compute:
             if not staged_v3_capability_supported(
                 quant=self.quant_mode,
                 backend=V3_BACKEND_NORMAL,
@@ -582,7 +592,11 @@ class SymmBuffer:
             activation,
             int8_compute,
         )
-        route_scratch_num_bytes = _C.get_mega_moe_route_scratch_size_for_mega_moe(
+        if w4a8_compute:
+            # Rank-partial combine needs one slot per peer, after the same
+            # input/route prefix used by the per-expert combine layout.
+            num_bytes += max(0, group.size() - num_topk) * num_max_tokens_per_rank * hidden * 2
+        route_scratch_num_bytes = 0 if w4a8_compute else _C.get_mega_moe_route_scratch_size_for_mega_moe(
             group.size(),
             num_experts,
             num_max_tokens_per_rank,
@@ -663,7 +677,7 @@ class SymmBuffer:
         self.combine = slices[9]
         self.cuda_graph_num_tokens.fill_(self.cuda_graph_max_tokens_per_rank)
 
-        if prepare_opt_3stage:
+        if prepare_opt_3stage and not w4a8_compute:
             from .opt import prepare_opt_3stage
 
             prepare_opt_3stage(
@@ -733,6 +747,10 @@ class SymmBuffer:
         self.l2_acts_sf = None
         self.combine = None
         self.route_scratch = None
+        if getattr(self, "quant_mode", None) == "w4a8":
+            self._w4a8_workspace = None
+            self._w4a8_inverse = None
+            self._w4a8_route_weights = None
         self.cuda_graph_num_tokens = None
         self._opt_3stage_state = None
 
@@ -763,9 +781,9 @@ def get_symm_buffer_for_mega_moe(
     )
     num_max_tokens_per_rank = _align(
         num_max_tokens_per_rank,
-        _C.get_token_alignment_for_mega_moe(),
+        64 if quant_mode == "w4a8" else _C.get_token_alignment_for_mega_moe(),
     )
-    if _symm_warmup_alloc_enabled(
+    if quant_mode != "w4a8" and _symm_warmup_alloc_enabled(
         requested_num_max_tokens_per_rank,
         num_experts,
         num_topk,
