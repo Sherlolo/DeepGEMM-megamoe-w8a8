@@ -7,6 +7,7 @@ Run from outside the source root after ``python setup.py install``:
 
 import argparse
 import faulthandler
+import gc
 import json
 import os
 import time
@@ -22,7 +23,7 @@ from lightop.activation import fuse_silu_mul_quant
 from lightop.quant import per_token_quant_int8
 from lightop.moe import ep_gather
 from megamoe import SymmBuffer, get_symm_buffer_for_mega_moe
-from megamoe.w4a8 import grouped_gemm, w4a8_mega_moe
+from megamoe.w4a8 import grouped_gemm, w4a8_mega_moe, _stage_w4a8_inputs
 
 
 def packed_weight(e, n, k):
@@ -34,19 +35,25 @@ def packed_weight(e, n, k):
 
 
 def timing(fn, byte_count, warmup=10, iterations=100):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    samples = []
-    for _ in range(iterations):
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(warmup):
+            fn()
         torch.cuda.synchronize()
-        start = time.perf_counter()
-        fn()
-        torch.cuda.synchronize()
-        samples.append((time.perf_counter() - start) * 1e6)
+        samples = []
+        for _ in range(iterations):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            fn()
+            torch.cuda.synchronize()
+            samples.append((time.perf_counter() - start) * 1e6)
+    finally:
+        if gc_enabled:
+            gc.enable()
     values = torch.tensor(samples, dtype=torch.float64)
     mean = values.mean().item()
-    return dict(mean_us=mean, p50_us=values.quantile(0.5).item(),
+    return dict(gc_during_timing=False, mean_us=mean, p50_us=values.quantile(0.5).item(),
                 p90_us=values.quantile(0.9).item(), cv=values.std().item() / mean,
                 effective_GB_s=byte_count / mean / 1000)
 
@@ -172,15 +179,23 @@ def test_distributed(args):
             buf.x_sf[:args.tokens].copy_(sx.reshape(-1))
             buf.topk_idx[:args.tokens].copy_(ids)
             buf.topk_weights[:args.tokens].copy_(weights)
+            _stage_w4a8_inputs(x, ids, weights, buf)
             y = torch.empty((tokens, args.hidden), device="cuda", dtype=torch.bfloat16)
             if case == args.benchmark_case:
-                benchmark_inputs = (qx, sx, ids, weights, y)
+                benchmark_inputs = (x, qx, sx, ids, weights, y, group_map)
             for clamp in (None, 10.0):
                 ref = reference_moe(*gathered, l1, l2, rank, e, clamp, group_map)[:tokens]
                 fn = lambda: w4a8_mega_moe(y, l1, l2, buf, activation_clamp=clamp,
                                           combine_group_map=group_map)
                 fn()
                 torch.cuda.synchronize()
+                if case == args.benchmark_case and clamp == 10.0:
+                    benchmark_reference = ref.clone()
+                if (clamp is not None and os.environ.get("MEGAMOE_W4A8_DEVICE_ROWS", "1") == "1"
+                        and hasattr(buf, "_w4a8_active_rows")):
+                    needed = buf._w4a8_active_rows
+                    allocated = buf._w4a8_workspace[0][0]
+                    assert needed <= allocated <= max(64, 2 * needed), (needed, allocated)
                 mismatch = (y != ref).sum()
                 if mismatch.item():
                     delta = (y.float() - ref.float()).abs()
@@ -197,12 +212,16 @@ def test_distributed(args):
                     print(json.dumps(dict(test="moe", case=case, clamp=clamp,
                                           correctness="exact DeepGEMM composition parity")), flush=True)
         if not args.correctness_only:
-            qx, sx, ids, weights, y = benchmark_inputs
+            x, qx, sx, ids, weights, y, benchmark_groups = benchmark_inputs
             buf.x[:args.tokens].copy_(qx)
             buf.x_sf[:args.tokens].copy_(sx.reshape(-1))
             buf.topk_idx[:args.tokens].copy_(ids)
             buf.topk_weights[:args.tokens].copy_(weights)
-            fn = lambda: w4a8_mega_moe(y, l1, l2, buf, activation_clamp=10.0)
+            def fn():
+                if args.include_input_staging:
+                    _stage_w4a8_inputs(x, ids, weights, buf)
+                w4a8_mega_moe(y, l1, l2, buf, activation_clamp=10.0,
+                              combine_group_map=benchmark_groups)
             if os.environ.get("W4A8_DEBUG_STACKS") == "1":
                 print(f"rank {rank}: entering timing", flush=True)
                 faulthandler.dump_traceback_later(15, repeat=True)
@@ -217,7 +236,19 @@ def test_distributed(args):
             for repeat in range(3 if paired else 1):
                 for mode in modes:
                     os.environ[env_key] = mode
+                    fn()
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(y, benchmark_reference, atol=0, rtol=0)
+                    allocations_before = getattr(buf, "_w4a8_workspace_allocations", 0)
                     stats = timing(fn, bytes_)
+                    workspace = getattr(buf, "_w4a8_workspace", ())
+                    stats["workspace_bytes"] = sum(t.numel() * t.element_size()
+                                                   for t in workspace if isinstance(t, torch.Tensor))
+                    stats["allocated_bytes"] = torch.cuda.memory_allocated()
+                    stats["reserved_bytes"] = torch.cuda.memory_reserved()
+                    stats["includes_input_staging"] = args.include_input_staging
+                    stats["workspace_allocations_warmup_and_timed"] = (
+                        getattr(buf, "_w4a8_workspace_allocations", 0) - allocations_before)
                     if rank == 0:
                         print(json.dumps(dict(test="moe_timing", routing=args.benchmark_case, config={env_key: mode},
                                               repeat=repeat, clamp=10.0, **stats)), flush=True)
@@ -232,11 +263,12 @@ if __name__ == "__main__":
     parser.add_argument("--gemm", action="store_true")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--paired-scatter", action="store_true")
+    parser.add_argument("--include-input-staging", action="store_true")
     parser.add_argument("--paired-device-rows", action="store_true")
     parser.add_argument("--paired-reuse-combine", action="store_true")
     parser.add_argument("--paired-compact-combine", action="store_true")
     parser.add_argument("--paired-rank-partials", action="store_true")
-    parser.add_argument("--benchmark-case", choices=("uniform", "skew"), default="uniform")
+    parser.add_argument("--benchmark-case", choices=("uniform", "skew", "static_map"), default="uniform")
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int, default=384)

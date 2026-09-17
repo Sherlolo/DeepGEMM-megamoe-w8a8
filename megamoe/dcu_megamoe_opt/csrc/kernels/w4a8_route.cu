@@ -85,6 +85,41 @@ __global__ void gather_kernel(uint8_t* sym, RouteLayout p, const int* routes,
     }
 }
 
+// Read each peer token once and fan it out to this rank's expert rows.
+__global__ void gather_tokens_kernel(uint8_t* sym, RouteLayout p, const int* inverse,
+                                     int4* x, float* scales) {
+    const int source = (blockIdx.x + p.rank) & 7;
+    const int token = blockIdx.x >> 3;
+    const int task_base = (source * p.capacity + token) * p.topk;
+    unsigned slots = 0;
+    for (int slot = 0; slot < p.topk; ++slot) {
+        if (inverse[task_base + slot] >= 0) slots |= 1u << slot;
+    }
+    if (!slots) return;
+    auto* peer = dcu_peer_sym_buffer_ptrs(sym)[source];
+    const int vectors_per_row = p.hidden / 16;
+    const auto* input = reinterpret_cast<const int4*>(peer + p.input_offset()) +
+        int64_t(token) * vectors_per_row;
+    for (int column = threadIdx.x; column < vectors_per_row; column += blockDim.x) {
+        const int4 value = input[column];
+        unsigned remaining = slots;
+        do {
+            const int slot = __builtin_ctz(remaining);
+            remaining &= remaining - 1;
+            const int row = inverse[task_base + slot];
+            x[int64_t(row) * vectors_per_row + column] = value;
+        } while (remaining);
+    }
+    if (threadIdx.x == 0) {
+        const float scale = reinterpret_cast<const float*>(peer + p.scale_offset())[token];
+        do {
+            const int slot = __builtin_ctz(slots);
+            slots &= slots - 1;
+            scales[inverse[task_base + slot]] = scale;
+        } while (slots);
+    }
+}
+
 template<bool Vectorized>
 __global__ void scatter_kernel(uint8_t* sym, RouteLayout p, const int* routes,
                                const hip_bfloat16* y, int rows) {
@@ -311,9 +346,15 @@ void gather_routes(torch::Tensor sym, torch::Tensor offsets, torch::Tensor route
     routes_kernel<true><<<(ranks * capacity * topk + 255) / 256, 256, 0, stream>>>(
         (uint8_t*)sym.data_ptr(), p, counts.data_ptr<int>(), offsets.data_ptr<int>(),
         routes.data_ptr<int>(), indices.data_ptr<int>(), inverse_ptr, route_weights_ptr);
-    if (rows) gather_kernel<<<std::min(rows, 4096), 256, 0, stream>>>((uint8_t*)sym.data_ptr(), p,
-        routes.data_ptr<int>(), x.data_ptr<int8_t>(), scales.data_ptr<float>(), rows,
-        device_rows ? offsets.data_ptr<int>() + experts / ranks : nullptr);
+    if (rows && device_rows && inverse_ptr && topk <= 32) {
+        gather_tokens_kernel<<<ranks * capacity, 128, 0, stream>>>(
+            (uint8_t*)sym.data_ptr(), p, inverse_ptr,
+            reinterpret_cast<int4*>(x.data_ptr<int8_t>()), scales.data_ptr<float>());
+    } else if (rows) {
+        gather_kernel<<<std::min(rows, 4096), 256, 0, stream>>>((uint8_t*)sym.data_ptr(), p,
+            routes.data_ptr<int>(), x.data_ptr<int8_t>(), scales.data_ptr<float>(), rows,
+            device_rows ? offsets.data_ptr<int>() + experts / ranks : nullptr);
+    }
     TORCH_CHECK(hipGetLastError() == hipSuccess, "W4A8 route gather launch failed");
 }
 

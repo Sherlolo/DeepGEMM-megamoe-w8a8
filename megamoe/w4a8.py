@@ -1,11 +1,44 @@
 """Packed INT4 / INT8 HIPC MegaMoE for EP8 prefill."""
 
+import logging
 import os
 
 import torch
 
 from .dcu_megamoe_opt import w4a8_ext
 from .dcu_megamoe_opt.K3_fused.k3_fused import rank_barrier
+
+logger = logging.getLogger(__name__)
+
+
+def _stage_w4a8_inputs(x, ids, weights, buffer):
+    """Stage inputs with fused reference quantization on supported layouts."""
+    tokens, hidden = x.shape
+    if tokens == 0:
+        return
+    if tokens > buffer.x.shape[0] or hidden != buffer.x.shape[1]:
+        raise ValueError("W4A8 input exceeds the staging buffer shape")
+    if (ids.ndim != 2 or weights.shape != ids.shape or ids.shape[0] != tokens
+            or ids.shape[1] != buffer.topk_idx.shape[1]
+            or ids.shape[1] != buffer.topk_weights.shape[1]
+            or buffer.topk_idx.shape[0] < tokens or buffer.topk_weights.shape[0] < tokens
+            or buffer.x_sf.numel() < tokens):
+        raise ValueError("W4A8 staging route shape mismatch")
+    if any(t.device != buffer.x.device for t in (x, ids, weights, buffer.x_sf,
+                                                buffer.topk_idx, buffer.topk_weights)):
+        raise ValueError("W4A8 staging tensors must share a device")
+    if (x.dtype == torch.bfloat16 and x.shape[1] == 4096
+            and ids.shape[1] == 6 and x.is_contiguous()
+            and ids.is_contiguous() and weights.is_contiguous()):
+        from ._w4a8_staging import stage_inputs
+        stage_inputs(x, ids, weights, buffer)
+    else:
+        from lightop.quant import per_token_quant_int8
+        qx, scale = per_token_quant_int8(x.contiguous())
+        buffer.x[:tokens].copy_(qx)
+        buffer.x_sf[:tokens].copy_(scale.reshape(-1))
+        buffer.topk_idx[:tokens].copy_(ids)
+        buffer.topk_weights[:tokens].copy_(weights)
 
 
 def grouped_gemm(x, weight, out, indices, *, block_m=64, n_loop=4):
@@ -77,7 +110,9 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
                      os.environ.get("MEGAMOE_W4A8_RANK_PARTIALS", "1") == "1")
     inverse = None
     route_weights = None
-    if rank_partials:
+    mapped_gather = (p.num_topk == 6 and activation_clamp is not None
+                     and os.environ.get("MEGAMOE_W4A8_DEVICE_ROWS", "1") == "1")
+    if rank_partials or mapped_gather:
         if not hasattr(p, "_w4a8_inverse"):
             p._w4a8_inverse = torch.empty(ranks * p.num_max_tokens_per_rank * p.num_topk,
                                           device=y.device, dtype=torch.int32)
@@ -91,12 +126,22 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
     offsets = w4a8_ext.count_routes(p.buffer, *args, alignment)
     device_rows = activation_clamp is not None and os.environ.get("MEGAMOE_W4A8_DEVICE_ROWS", "1") == "1"
     if device_rows:
-        # Every peer route may land here, plus per-expert alignment padding.
-        bound = ranks * p.num_max_tokens_per_rank * p.num_topk + local_experts * (alignment - 1)
-        rows = (bound + alignment - 1) // alignment * alignment
-        key = (rows, hidden, intermediate)
+        active_rows = int(offsets[-1].item())
+        p._w4a8_active_rows = active_rows
         cached = getattr(p, "_w4a8_workspace", None)
+        if (cached is not None and cached[0][1:] == (hidden, intermediate)
+                and active_rows <= cached[0][0] <= max(alignment, 2 * active_rows)
+                and cached[0][0] % alignment == 0):
+            rows = cached[0][0]
+        else:
+            quantum = max(alignment, ((active_rows + 8 * alignment - 1)
+                                       // (8 * alignment)) * alignment)
+            rows = ((active_rows + quantum - 1) // quantum) * quantum
+        key = (rows, hidden, intermediate)
         if cached is None or cached[0] != key:
+            # Release stale oversized buffers before allocating their replacement.
+            p._w4a8_workspace = None
+            cached = None
             routes = torch.empty(rows, dtype=torch.int32, device=y.device)
             indices = torch.empty_like(routes)
             x = torch.empty((rows, hidden), dtype=torch.int8, device=y.device)
@@ -107,6 +152,9 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
             down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=y.device)
             cached = (key, routes, indices, x, scale, gate_up, act, act_scale, down)
             p._w4a8_workspace = cached
+            p._w4a8_workspace_allocations = getattr(p, "_w4a8_workspace_allocations", 0) + 1
+            logger.info("W4A8 workspace rank=%d rows=%d active_rows=%s bytes=%d",
+                        rank, rows, active_rows, rows * (3 * hidden + 5 * intermediate + 16))
         _, routes, indices, x, scale, gate_up, act, act_scale, down = cached
     else:
         rows = int(offsets[-1].item())

@@ -1,4 +1,5 @@
 cmake-build-*
+.humanize*
 .idea
 .DS_Store
 build
