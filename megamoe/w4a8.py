@@ -140,18 +140,22 @@ def w4a8_mega_moe(y, l1_weights, l2_weights, sym_buffer,
         cached = None
         routes = torch.empty(rows, dtype=torch.int32, device=y.device)
         indices = torch.empty_like(routes)
-        x = torch.empty((rows, hidden), dtype=torch.int8, device=y.device)
+        # Current-stream stages do not overlap: x is dead before activation,
+        # and gate_up is dead before the down-projection writes its output.
+        quant_storage = torch.empty(rows * max(hidden, intermediate), dtype=torch.int8, device=y.device)
+        gemm_storage = torch.empty(rows * max(2 * intermediate, hidden), dtype=torch.bfloat16, device=y.device)
+        x = quant_storage[:rows * hidden].view(rows, hidden)
+        act = quant_storage[:rows * intermediate].view(rows, intermediate)
+        gate_up = gemm_storage[:rows * 2 * intermediate].view(rows, 2 * intermediate)
+        down = gemm_storage[:rows * hidden].view(rows, hidden)
         scale = torch.empty(rows, dtype=torch.float32, device=y.device)
-        gate_up = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device=y.device)
-        act = torch.empty((rows, intermediate), dtype=torch.int8, device=y.device)
-        act_scale = torch.empty((rows, 1), dtype=torch.float32, device=y.device)
-        down = torch.empty((rows, hidden), dtype=torch.bfloat16, device=y.device)
+        act_scale = scale.view(rows, 1)
         cached = (key, routes, indices, x, scale, gate_up, act, act_scale, down)
         p._w4a8_workspace = cached
         p._w4a8_workspace_allocations = getattr(p, "_w4a8_workspace_allocations", 0) + 1
         if os.environ.get("MEGAMOE_ENABLE_LOGGING", "0") == "1":
             logger.info("W4A8 workspace rank=%d capacity_rows=%d bytes=%d",
-                        rank, rows, rows * (3 * hidden + 5 * intermediate + 16))
+                        rank, rows, rows * (max(hidden, intermediate) + 2 * max(2 * intermediate, hidden) + 12))
     _, routes, indices, x, scale, gate_up, act, act_scale, down = cached
     w4a8_ext.gather_routes(p.buffer, offsets, routes, indices, x, scale, *args,
                            device_rows, inverse, route_weights)
